@@ -24,7 +24,7 @@ app.get('/health', (req, res) => {
 });
 
 // Routes
-app.use('/api/auth', authRoutes);
+app.use('/auth', authRoutes);
 app.use('/api/playlist', playlistRoutes);
 app.use('/api/genres', genreRoutes);
 

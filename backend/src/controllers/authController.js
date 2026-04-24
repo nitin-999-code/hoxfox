@@ -1,52 +1,55 @@
-// Controllers for OAuth routes
-const spotifyService = require('../services/spotifyService');
+const querystring = require('querystring');
+const authService = require('../services/authService');
 
-const login = async (req, res, next) => {
+const login = async (req, res) => {
   try {
-    const scope = 'playlist-read-private playlist-modify-private playlist-modify-public';
-    const params = new URLSearchParams({
+    const scope = 'user-read-private user-read-email playlist-read-private playlist-modify-public playlist-modify-private';
+    
+    const query = querystring.stringify({
       response_type: 'code',
       client_id: process.env.SPOTIFY_CLIENT_ID,
       scope: scope,
-      redirect_uri: process.env.SPOTIFY_REDIRECT_URI,
+      redirect_uri: process.env.REDIRECT_URI
     });
-    
-    res.redirect(`https://accounts.spotify.com/authorize?${params.toString()}`);
+
+    res.redirect(`https://accounts.spotify.com/authorize?${query}`);
   } catch (error) {
-    next(error);
+    res.status(500).json({ error: 'Failed to initiate login' });
   }
 };
 
-const callback = async (req, res, next) => {
+const callback = async (req, res) => {
   try {
-    const code = req.query.code || null;
+    const { code } = req.body;
+    
     if (!code) {
-      return res.status(400).json({ error: 'Code not provided' });
+      return res.status(400).json({ error: 'Code is required' });
     }
-    
-    const tokenData = await spotifyService.getSpotifyToken(code);
-    res.json(tokenData);
+
+    const tokenData = await authService.exchangeCodeForToken(code);
+    res.status(200).json(tokenData);
   } catch (error) {
-    next(error);
+    res.status(500).json({ error: 'Failed to exchange code for token' });
   }
 };
 
-const refresh = async (req, res, next) => {
+const refreshToken = async (req, res) => {
   try {
-    const { refresh_token } = req.body;
-    if (!refresh_token) {
-      return res.status(400).json({ error: 'Refresh token not provided' });
-    }
+    const { refreshToken } = req.body;
     
-    const tokenData = await spotifyService.refreshSpotifyToken(refresh_token);
-    res.json(tokenData);
+    if (!refreshToken) {
+      return res.status(400).json({ error: 'Refresh token is required' });
+    }
+
+    const tokenData = await authService.refreshAccessToken(refreshToken);
+    res.status(200).json(tokenData);
   } catch (error) {
-    next(error);
+    res.status(500).json({ error: 'Failed to refresh token' });
   }
 };
 
 module.exports = {
   login,
   callback,
-  refresh
+  refreshToken
 };
