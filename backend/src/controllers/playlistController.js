@@ -18,6 +18,23 @@ const getTracks = async (req, res, next) => {
   }
 };
 
+const getUserPlaylists = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(401).json({ error: 'Authorization header missing' });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const playlists = await spotifyService.getUserPlaylists(token);
+
+    res.json({ playlists });
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
-  getTracks
+  getTracks,
+  getUserPlaylists
 };
