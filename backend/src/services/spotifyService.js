@@ -7,7 +7,7 @@ async function safeSpotifyRequest(requestFn, token, refreshToken) {
   try {
     return await requestFn(token);
   } catch (error) {
-    if (error.response?.status === 401) {
+    if (error.response?.status === 401 && refreshToken) {
       console.log("Access token expired — refreshing...");
       const newToken = await refreshAccessToken(refreshToken);
       return await requestFn(newToken);
@@ -27,34 +27,86 @@ async function getUserPlaylists(token, refreshToken) {
           }
         }
       );
-      return response.data.items;
+
+      const items = response.data.items;
+
+      // Debug: log raw keys of first playlist to understand structure
+      if (items && items.length > 0) {
+        console.log("Playlist[0] keys:", Object.keys(items[0]));
+        console.log("Playlist[0].tracks:", items[0].tracks);
+        console.log("Playlist[0].name:", items[0].name);
+      }
+
+      return items;
     },
     token,
     refreshToken
   );
 }
 
-async function getPlaylistTracks(playlistId, accessToken) {
-  try {
-    console.log("Fetching tracks for playlist:", playlistId);
+async function getPlaylistTracks(playlistId, accessToken, refreshToken) {
+  return safeSpotifyRequest(
+    async token => {
+      console.log("Fetching tracks for playlist:", playlistId);
 
-    const response = await axios.get(
-      `https://api.spotify.com/v1/playlists/${playlistId}/tracks`,
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json"
+      // Step 1: Get the playlist object
+      const response = await axios.get(
+        `${BASE_URL}/playlists/${playlistId}`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json"
+          }
+        }
+      );
+
+      const data = response.data;
+
+      // Find the paging object (standard: data.tracks, dev mode: data.items)
+      const pagingObj = data.tracks || data.items;
+      if (!pagingObj || typeof pagingObj !== 'object') {
+        console.log("No paging object found in response");
+        return [];
+      }
+
+      // Collect all items across pages
+      let allRawItems = Array.isArray(pagingObj.items) ? [...pagingObj.items] : [];
+      let nextUrl = pagingObj.next;
+      const total = pagingObj.total || allRawItems.length;
+
+      console.log(`First page: ${allRawItems.length} items, total: ${total}, has next: ${!!nextUrl}`);
+
+      // Follow pagination to get ALL tracks
+      while (nextUrl) {
+        try {
+          const nextResponse = await axios.get(nextUrl, {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+          const nextItems = nextResponse.data.items || [];
+          allRawItems = allRawItems.concat(nextItems);
+          nextUrl = nextResponse.data.next;
+          console.log(`Fetched page: +${nextItems.length} items (total so far: ${allRawItems.length})`);
+        } catch (pageErr) {
+          console.log("Pagination fetch failed:", pageErr.response?.status);
+          break;
         }
       }
-    );
 
-    console.log("Tracks fetched:", response.data.items.length);
+      console.log("All raw items collected:", allRawItems.length);
 
-    return response.data.items;
-  } catch (error) {
-    console.error("Spotify API error:", error.response?.data);
-    throw error;
-  }
+      // Normalize: map entry.item (Dev Mode) or entry.track (Standard) to { track: {...} }
+      const tracks = allRawItems.map(entry => {
+        if (entry.track) return entry;
+        if (entry.item) return { track: entry.item };
+        return { track: entry };
+      });
+
+      console.log("Returning", tracks.length, "normalized tracks");
+      return tracks;
+    },
+    accessToken,
+    refreshToken
+  );
 }
 
 const getAudioFeatures = async (trackIds, token, refreshToken) => {

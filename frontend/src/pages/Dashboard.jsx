@@ -47,7 +47,7 @@ const Dashboard = () => {
             // Handle both raw Spotify objects and custom mapped objects
             const trackCount = typeof playlist.tracks === 'number' 
               ? playlist.tracks 
-              : playlist.tracks?.total ?? playlist.trackCount ?? 0;
+              : playlist.tracks?.total ?? playlist.trackCount ?? null;
               
             return (
               <Link 
@@ -61,7 +61,7 @@ const Dashboard = () => {
                   <div className="w-full aspect-square bg-gray-600 rounded-md mb-4 flex items-center justify-center text-gray-400 shadow-md">No Image</div>
                 )}
                 <h2 className="text-lg font-semibold truncate mb-1" title={playlist.name}>{playlist.name}</h2>
-                <p className="text-sm text-gray-400">{trackCount} tracks</p>
+                <p className="text-sm text-gray-400">{trackCount !== null ? `${trackCount} tracks` : 'View tracks →'}</p>
               </Link>
             );
           })}

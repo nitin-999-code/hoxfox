@@ -10,7 +10,8 @@ const login = async (req, res) => {
       "playlist-modify-private",
       "playlist-modify-public",
       "user-read-private",
-      "user-read-email"
+      "user-read-email",
+      "user-library-read"
     ].join(" ");
 
     console.log("Using Spotify scopes:", scope);
