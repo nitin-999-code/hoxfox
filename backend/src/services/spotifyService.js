@@ -1,14 +1,54 @@
-const axios = require("axios");
-const { refreshAccessToken } = require("./authService");
+/**
+ * spotifyService.js
+ * All communication with the Spotify Web API.
+ *
+ * Allowed endpoints (per spec — audio-features is EXCLUDED, it causes 403):
+ *   GET /me/playlists
+ *   GET /playlists/:id  (+ pagination via /playlists/:id/tracks)
+ *   GET /artists?ids=…  (batch up to 50 per request)
+ *   POST /users/:uid/playlists
+ *   POST /playlists/:id/tracks
+ *
+ * Features:
+ *   - Automatic token refresh on 401
+ *   - In-memory LRU cache for artist → genres (survives across requests)
+ *   - Artist genre batching (50 per request, Spotify limit)
+ */
 
-const BASE_URL = "https://api.spotify.com/v1";
+const axios = require('axios');
+const { refreshAccessToken } = require('./authService');
 
+const BASE_URL = 'https://api.spotify.com/v1';
+
+// ── Simple in-memory LRU cache ─────────────────────────────────────────────
+const CACHE_MAX = 2000; // store up to 2000 artists
+const _artistCache = new Map();
+
+function _cacheGet(artistId) {
+  if (!_artistCache.has(artistId)) return null;
+  // LRU: move to end on access
+  const val = _artistCache.get(artistId);
+  _artistCache.delete(artistId);
+  _artistCache.set(artistId, val);
+  return val;
+}
+
+function _cacheSet(artistId, genres) {
+  if (_artistCache.size >= CACHE_MAX) {
+    // Evict oldest entry (first key)
+    const firstKey = _artistCache.keys().next().value;
+    _artistCache.delete(firstKey);
+  }
+  _artistCache.set(artistId, genres);
+}
+
+// ── Token-refresh wrapper ──────────────────────────────────────────────────
 async function safeSpotifyRequest(requestFn, token, refreshToken) {
   try {
     return await requestFn(token);
   } catch (error) {
     if (error.response?.status === 401 && refreshToken) {
-      console.log("Access token expired — refreshing...");
+      console.log('[spotify] Access token expired — refreshing...');
       const newToken = await refreshAccessToken(refreshToken);
       return await requestFn(newToken);
     }
@@ -16,92 +56,59 @@ async function safeSpotifyRequest(requestFn, token, refreshToken) {
   }
 }
 
+// ── User playlists ─────────────────────────────────────────────────────────
 async function getUserPlaylists(token, refreshToken) {
   return safeSpotifyRequest(
     async accessToken => {
-      const response = await axios.get(
-        `${BASE_URL}/me/playlists`,
-        {
-          headers: {
-            Authorization: `Bearer ${accessToken}`
-          }
-        }
-      );
-
-      const items = response.data.items;
-
-      // Debug: log raw keys of first playlist to understand structure
-      if (items && items.length > 0) {
-        console.log("Playlist[0] keys:", Object.keys(items[0]));
-        console.log("Playlist[0].tracks:", items[0].tracks);
-        console.log("Playlist[0].name:", items[0].name);
-      }
-
-      return items;
+      const response = await axios.get(`${BASE_URL}/me/playlists`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      return response.data.items;
     },
     token,
     refreshToken
   );
 }
 
+// ── Playlist tracks (with full pagination) ─────────────────────────────────
 async function getPlaylistTracks(playlistId, accessToken, refreshToken) {
   return safeSpotifyRequest(
     async token => {
-      console.log("Fetching tracks for playlist:", playlistId);
+      console.log('[spotify] Fetching tracks for playlist:', playlistId);
 
-      // Step 1: Get the playlist object
-      const response = await axios.get(
-        `${BASE_URL}/playlists/${playlistId}`,
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json"
-          }
-        }
-      );
-
+      // Use the standard playlist endpoint to get tracks
+      const response = await axios.get(`${BASE_URL}/playlists/${playlistId}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
       const data = response.data;
-
-      // Find the paging object (standard: data.tracks, dev mode: data.items)
+      
       const pagingObj = data.tracks || data.items;
-      if (!pagingObj || typeof pagingObj !== 'object') {
-        console.log("No paging object found in response");
-        return [];
-      }
+      if (!pagingObj || typeof pagingObj !== 'object') return [];
 
-      // Collect all items across pages
       let allRawItems = Array.isArray(pagingObj.items) ? [...pagingObj.items] : [];
       let nextUrl = pagingObj.next;
-      const total = pagingObj.total || allRawItems.length;
 
-      console.log(`First page: ${allRawItems.length} items, total: ${total}, has next: ${!!nextUrl}`);
-
-      // Follow pagination to get ALL tracks
       while (nextUrl) {
         try {
-          const nextResponse = await axios.get(nextUrl, {
+          const nextRes = await axios.get(nextUrl, {
             headers: { Authorization: `Bearer ${token}` }
           });
-          const nextItems = nextResponse.data.items || [];
+          const nextItems = nextRes.data.items || [];
           allRawItems = allRawItems.concat(nextItems);
-          nextUrl = nextResponse.data.next;
-          console.log(`Fetched page: +${nextItems.length} items (total so far: ${allRawItems.length})`);
+          nextUrl = nextRes.data.next;
         } catch (pageErr) {
-          console.log("Pagination fetch failed:", pageErr.response?.status);
+          console.warn('[spotify] Pagination fetch failed:', pageErr.response?.status);
           break;
         }
       }
 
-      console.log("All raw items collected:", allRawItems.length);
-
-      // Normalize: map entry.item (Dev Mode) or entry.track (Standard) to { track: {...} }
+      // Normalise: handle both { track: {...} } and bare track objects
       const tracks = allRawItems.map(entry => {
-        if (entry.track) return entry;
-        if (entry.item) return { track: entry.item };
+        if (entry && entry.track) return entry;
+        if (entry && entry.item) return { track: entry.item };
         return { track: entry };
       });
 
-      console.log("Returning", tracks.length, "normalized tracks");
       return tracks;
     },
     accessToken,
@@ -109,54 +116,113 @@ async function getPlaylistTracks(playlistId, accessToken, refreshToken) {
   );
 }
 
-const getAudioFeatures = async (trackIds, token, refreshToken) => {
-  return safeSpotifyRequest(
-    async accessToken => {
-      const ids = trackIds.join(',');
-      const response = await axios.get(`${BASE_URL}/audio-features?ids=${ids}`, {
-        headers: { Authorization: `Bearer ${accessToken}` }
-      });
-      return response.data;
-    },
-    token,
-    refreshToken
-  );
-};
+// ── Artist genre fetch — batched + cached ─────────────────────────────────
+/**
+ * Fetch genres for a list of artist IDs.
+ * - Checks in-memory cache first (avoids redundant API calls)
+ * - Batches remaining IDs in groups of 50 (Spotify limit)
+ * - Returns { [artistId]: string[] }
+ *
+ * @param {string[]} artistIds
+ * @param {string}   token
+ * @param {string}   refreshToken
+ * @returns {Promise<{ [artistId]: string[] }>}
+ */
+async function getArtistGenresBatched(artistIds, token, refreshToken) {
+  const unique = [...new Set(artistIds.filter(Boolean))];
+  const result = {};
+  const uncached = [];
 
-const createPlaylist = async (userId, name, token, refreshToken) => {
-  return safeSpotifyRequest(
-    async accessToken => {
-      const response = await axios.post(`${BASE_URL}/users/${userId}/playlists`, {
-        name: name
-      }, {
-        headers: { Authorization: `Bearer ${accessToken}` }
-      });
-      return response.data;
-    },
-    token,
-    refreshToken
-  );
-};
+  // Serve from cache where possible
+  for (const id of unique) {
+    const cached = _cacheGet(id);
+    if (cached !== null) {
+      result[id] = cached;
+    } else {
+      uncached.push(id);
+    }
+  }
 
-const addTracksToPlaylist = async (playlistId, uris, token, refreshToken) => {
+  if (uncached.length === 0) {
+    console.log('[spotify] All artist genres served from cache');
+    return result;
+  }
+
+  console.log(`[spotify] Fetching genres for ${uncached.length} artists (${unique.length - uncached.length} cached)`);
+
+  // Batch in groups of 50
+  const BATCH_SIZE = 50;
+  for (let i = 0; i < uncached.length; i += BATCH_SIZE) {
+    const batch = uncached.slice(i, i + BATCH_SIZE);
+    try {
+      const data = await safeSpotifyRequest(
+        async tkn => {
+          const res = await axios.get(`${BASE_URL}/artists`, {
+            params: { ids: batch.join(',') },
+            headers: { Authorization: `Bearer ${tkn}` },
+          });
+          return res.data;
+        },
+        token,
+        refreshToken
+      );
+
+      const artists = data.artists || [];
+      for (const artist of artists) {
+        if (!artist) continue;
+        const genres = artist.genres || [];
+        result[artist.id] = genres;
+        _cacheSet(artist.id, genres);
+      }
+    } catch (err) {
+      console.warn(`[spotify] Artist batch ${i}–${i + BATCH_SIZE} failed:`, err.response?.status, err.message);
+      // Mark as empty so we don't retry on this run
+      for (const id of batch) {
+        if (!result[id]) result[id] = [];
+      }
+    }
+  }
+
+  return result;
+}
+
+// ── Create playlist ────────────────────────────────────────────────────────
+async function createPlaylist(userId, name, token, refreshToken) {
   return safeSpotifyRequest(
     async accessToken => {
-      const response = await axios.post(`${BASE_URL}/playlists/${playlistId}/tracks`, {
-        uris: uris
-      }, {
-        headers: { Authorization: `Bearer ${accessToken}` }
-      });
+      const response = await axios.post(
+        `${BASE_URL}/users/${userId}/playlists`,
+        { name, public: false },
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
       return response.data;
     },
     token,
     refreshToken
   );
-};
+}
+
+// ── Add tracks to playlist ─────────────────────────────────────────────────
+async function addTracksToPlaylist(playlistId, uris, token, refreshToken) {
+  return safeSpotifyRequest(
+    async accessToken => {
+      const response = await axios.post(
+        `${BASE_URL}/playlists/${playlistId}/tracks`,
+        { uris },
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      return response.data;
+    },
+    token,
+    refreshToken
+  );
+}
 
 module.exports = {
+  safeSpotifyRequest,
   getUserPlaylists,
   getPlaylistTracks,
-  getAudioFeatures,
+  getArtistGenresBatched,
   createPlaylist,
-  addTracksToPlaylist
+  addTracksToPlaylist,
 };

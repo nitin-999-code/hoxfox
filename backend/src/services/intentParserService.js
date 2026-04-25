@@ -1,124 +1,170 @@
-// lib/intent-parser.js
-// Converts natural language query → structured filter ranges
-// Step 1: Rule-based matching for common patterns
-// Step 2: LLM fallback (Gemini) for complex/ambiguous queries
+/**
+ * intentParserService.js
+ * Converts a natural language query → structured intent.
+ *
+ * Output shape:
+ * {
+ *   keywords:     string[],   // expanded with synonyms, used for fuzzy name matching
+ *   targetGenres: string[],   // cluster names (e.g. 'chill', 'hip-hop')
+ *   artist:       string|null,// explicit artist name if mentioned
+ *   label:        string,     // human-readable playlist label
+ *   source:       'rules'|'llm'
+ * }
+ *
+ * Strategy:
+ *   1. Rule-based matcher handles 90% of common queries (zero latency, no API cost)
+ *   2. Gemini LLM fallback for complex / ambiguous queries
+ *   3. Groq (llama-3.3-70b) second fallback if Gemini unavailable
+ *
+ * IMPORTANT: LLM is ONLY used for intent parsing.
+ *            Track data / playlist content is NEVER sent to the LLM.
+ */
 
-const DEFAULT_WEIGHTS = {
-  energy: 1,
-  tempo: 0.8,
-  valence: 1,
-  danceability: 0.8,
-  acousticness: 0.7,
-  instrumentalness: 0.5,
-  speechiness: 0.4,
-};
+const { expandKeywords } = require('../utils/synonyms');
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Rule table: keyword triggers → { keywords, genres, label }
+// keywords here are ROOT words — they get synonym-expanded before scoring
+// genres must be cluster names from genreClusters.js
+// ─────────────────────────────────────────────────────────────────────────────
 const RULES = [
   {
-    keywords: ["sleep", "night", "bedtime", "calm", "relax", "lullaby", "wind down"],
-    filters: {
-      energy: { min: 0, max: 0.35 },
-      tempo: { min: 0, max: 90 },
-      valence: { min: 0, max: 0.55 },
-      acousticness: { min: 0.35, max: 1 },
-    },
-    weights: { energy: 1.5, tempo: 1.2, acousticness: 1.2 },
-    label: "Night & Sleep",
+    triggers:  ['sleep', 'bedtime', 'lullaby', 'wind down', 'insomnia'],
+    keywords:  ['sleep', 'night', 'calm', 'relax', 'soft'],
+    genres:    ['chill', 'classical', 'indie'],
+    label:     'Sleep & Wind Down',
   },
   {
-    keywords: ["workout", "gym", "exercise", "run", "running", "high energy", "pump up", "beast mode"],
-    filters: {
-      energy: { min: 0.7, max: 1 },
-      tempo: { min: 120, max: 200 },
-      danceability: { min: 0.5, max: 1 },
-    },
-    weights: { energy: 1.5, tempo: 1.3, danceability: 1.1 },
-    label: "Workout",
+    triggers:  ['workout', 'gym', 'exercise', 'run', 'running', 'beast mode', 'pump up'],
+    keywords:  ['workout', 'energy', 'pump', 'power', 'loud'],
+    genres:    ['hip-hop', 'pop', 'rock', 'electronic', 'metal'],
+    label:     'Workout Energy',
   },
   {
-    keywords: ["happy", "feel good", "joyful", "upbeat", "good mood", "cheerful", "positive"],
-    filters: {
-      valence: { min: 0.65, max: 1 },
-      energy: { min: 0.45, max: 1 },
-    },
-    weights: { valence: 1.5, energy: 1.1 },
-    label: "Happy Vibes",
+    triggers:  ['happy', 'feel good', 'joyful', 'upbeat', 'good mood', 'cheerful', 'positive'],
+    keywords:  ['happy', 'joy', 'upbeat', 'bright'],
+    genres:    ['pop', 'rnb', 'latin', 'indie'],
+    label:     'Happy Vibes',
   },
   {
-    keywords: ["sad", "heartbreak", "cry", "melancholy", "depressed", "breakup", "emotional"],
-    filters: {
-      valence: { min: 0, max: 0.35 },
-      energy: { min: 0, max: 0.5 },
-    },
-    weights: { valence: 1.5, energy: 1.0 },
-    label: "Sad / Emotional",
+    triggers:  ['sad', 'heartbreak', 'cry', 'melancholy', 'depressed', 'breakup', 'emotional'],
+    keywords:  ['sad', 'heartbreak', 'emotional', 'lonely'],
+    genres:    ['indie', 'rnb', 'pop', 'blues'],
+    label:     'Sad & Emotional',
   },
   {
-    keywords: ["chill", "lofi", "lo-fi", "study", "focus", "background", "reading", "coffee"],
-    filters: {
-      energy: { min: 0.1, max: 0.5 },
-      tempo: { min: 60, max: 110 },
-      valence: { min: 0.2, max: 0.7 },
-    },
-    weights: { energy: 1.3, tempo: 1.0 },
-    label: "Chill / Focus",
+    triggers:  ['chill', 'lofi', 'lo-fi', 'study', 'focus', 'background', 'reading', 'coffee'],
+    keywords:  ['chill', 'study', 'focus', 'relax'],
+    genres:    ['chill', 'indie', 'jazz', 'classical'],
+    label:     'Chill & Focus',
   },
   {
-    keywords: ["party", "dance", "club", "night out", "banger", "hype", "rave"],
-    filters: {
-      danceability: { min: 0.7, max: 1 },
-      energy: { min: 0.65, max: 1 },
-      tempo: { min: 110, max: 200 },
-    },
-    weights: { danceability: 1.5, energy: 1.3, tempo: 1.1 },
-    label: "Party / Dance",
+    triggers:  ['party', 'dance', 'club', 'night out', 'banger', 'hype', 'rave', 'festival'],
+    keywords:  ['party', 'dance', 'hype', 'loud'],
+    genres:    ['electronic', 'pop', 'hip-hop', 'latin'],
+    label:     'Party & Dance',
   },
   {
-    keywords: ["acoustic", "unplugged", "raw", "stripped"],
-    filters: {
-      acousticness: { min: 0.6, max: 1 },
-      instrumentalness: { min: 0, max: 0.5 },
-    },
-    weights: { acousticness: 1.5 },
-    label: "Acoustic",
+    triggers:  ['acoustic', 'unplugged', 'raw', 'stripped'],
+    keywords:  ['acoustic', 'guitar', 'raw', 'stripped'],
+    genres:    ['indie', 'country', 'blues', 'folk'],
+    label:     'Acoustic Vibes',
   },
   {
-    keywords: ["instrumental", "no vocals", "ambient", "classical", "jazz", "meditation"],
-    filters: {
-      instrumentalness: { min: 0.5, max: 1 },
-      speechiness: { min: 0, max: 0.1 },
-    },
-    weights: { instrumentalness: 1.5, speechiness: 1.2 },
-    label: "Instrumental",
+    triggers:  ['instrumental', 'no vocals', 'ambient', 'meditation', 'mindful'],
+    keywords:  ['instrumental', 'ambient', 'peaceful'],
+    genres:    ['classical', 'chill', 'jazz', 'electronic'],
+    label:     'Instrumental',
   },
   {
-    keywords: ["morning", "wake up", "sunrise", "fresh", "energize", "start the day"],
-    filters: {
-      energy: { min: 0.4, max: 0.8 },
-      valence: { min: 0.5, max: 1 },
-      tempo: { min: 90, max: 150 },
-    },
-    weights: { energy: 1.2, valence: 1.3 },
-    label: "Morning Energy",
+    triggers:  ['morning', 'wake up', 'sunrise', 'fresh', 'start the day'],
+    keywords:  ['morning', 'fresh', 'energize'],
+    genres:    ['pop', 'indie', 'rnb'],
+    label:     'Morning Energy',
   },
   {
-    keywords: ["rap", "hip hop", "hiphop", "trap", "bars"],
-    filters: {
-      speechiness: { min: 0.1, max: 1 },
-      danceability: { min: 0.5, max: 1 },
-    },
-    weights: { speechiness: 1.3, danceability: 1.1 },
-    label: "Rap / Hip-Hop",
+    triggers:  ['rap', 'hip hop', 'hiphop', 'hip-hop', 'trap', 'bars', 'drill'],
+    keywords:  ['rap', 'hip hop', 'trap', 'bars'],
+    genres:    ['hip-hop'],
+    label:     'Rap & Hip-Hop',
+  },
+  {
+    triggers:  ['rock', 'alternative', 'alt rock', 'guitar', 'punk', 'grunge'],
+    keywords:  ['rock', 'guitar', 'loud', 'electric'],
+    genres:    ['rock', 'metal', 'indie'],
+    label:     'Rock & Alternative',
+  },
+  {
+    triggers:  ['jazz', 'blues', 'swing', 'bebop'],
+    keywords:  ['jazz', 'improvisation', 'swing'],
+    genres:    ['jazz', 'blues'],
+    label:     'Jazz & Blues',
+  },
+  {
+    triggers:  ['classical', 'orchestra', 'symphony', 'piano', 'violin'],
+    keywords:  ['classical', 'orchestral', 'piano'],
+    genres:    ['classical'],
+    label:     'Classical',
+  },
+  {
+    triggers:  ['latin', 'reggaeton', 'salsa', 'bachata', 'afrobeats', 'dancehall'],
+    keywords:  ['latin', 'dance', 'rhythm'],
+    genres:    ['latin', 'reggae'],
+    label:     'Latin & Afro',
+  },
+  {
+    triggers:  ['metal', 'heavy', 'death metal', 'thrash', 'hardcore', 'screamo'],
+    keywords:  ['metal', 'heavy', 'intense', 'dark'],
+    genres:    ['metal', 'rock'],
+    label:     'Metal & Heavy',
+  },
+  {
+    triggers:  ['rnb', 'r&b', 'soul', 'neo soul', 'funk', 'groove'],
+    keywords:  ['soul', 'groove', 'smooth', 'rhythm'],
+    genres:    ['rnb'],
+    label:     'R&B & Soul',
+  },
+  {
+    triggers:  ['romantic', 'love', 'passion', 'date night', 'intimate'],
+    keywords:  ['romantic', 'love', 'tender', 'sweet'],
+    genres:    ['rnb', 'pop', 'jazz', 'indie'],
+    label:     'Romantic Mood',
+  },
+  {
+    triggers:  ['dark', 'moody', 'gloomy', 'brooding', 'gothic'],
+    keywords:  ['dark', 'moody', 'gloomy', 'ominous'],
+    genres:    ['electronic', 'metal', 'indie', 'rock'],
+    label:     'Dark & Moody',
+  },
+  {
+    triggers:  ['nostalgic', 'throwback', 'retro', '80s', '90s', 'old school', 'classic'],
+    keywords:  ['nostalgic', 'throwback', 'retro', 'classic'],
+    genres:    ['pop', 'rock', 'rnb', 'hip-hop'],
+    label:     'Throwback',
+  },
+  {
+    triggers:  ['drive', 'road trip', 'cruising', 'night drive', 'car'],
+    keywords:  ['drive', 'night', 'cruising', 'highway'],
+    genres:    ['pop', 'rock', 'electronic', 'indie'],
+    label:     'Late Night Drive',
   },
 ];
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Rule matching
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Try to match a query against the rule table.
+ * Returns the best-scoring rule or null.
+ */
 function matchRules(query) {
   const q = query.toLowerCase();
   let best = null;
   let bestScore = 0;
 
   for (const rule of RULES) {
-    const score = rule.keywords.filter((kw) => q.includes(kw)).length;
+    const score = rule.triggers.filter(t => q.includes(t)).length;
     if (score > bestScore) {
       bestScore = score;
       best = rule;
@@ -128,81 +174,153 @@ function matchRules(query) {
   return bestScore > 0 ? best : null;
 }
 
-const LLM_SYSTEM_PROMPT = `You are a music filter assistant. Given a user's natural language query about the kind of music they want to listen to, return a JSON object describing Spotify audio feature filter ranges and weights.
+// ─────────────────────────────────────────────────────────────────────────────
+// LLM system prompt — genre + keyword output (NOT audio features)
+// ─────────────────────────────────────────────────────────────────────────────
+const LLM_SYSTEM_PROMPT = `You are a music intent parser. Given a user's natural language query about music mood or genre, return a JSON object that describes WHAT KIND of music to look for — by keywords and genre clusters.
 
-Audio features and their value ranges:
-- energy: 0–1 (0=calm, 1=intense)
-- tempo: BPM, typically 60–200
-- valence: 0–1 (0=sad/dark, 1=happy/bright)
-- danceability: 0–1 (0=not danceable, 1=very danceable)
-- acousticness: 0–1 (0=electronic, 1=fully acoustic)
-- instrumentalness: 0–1 (0=has vocals, 1=no vocals)
-- speechiness: 0–1 (0=music, 1=spoken word)
+IMPORTANT:
+- Do NOT return audio feature ranges (energy, tempo, valence, etc.).
+- Do NOT include any playlist track data.
+- Output ONLY raw JSON, no markdown, no explanation.
 
-Respond ONLY with a valid JSON object, no markdown, no explanation:
+Available genre clusters (use ONLY these values in targetGenres):
+pop, hip-hop, rnb, rock, electronic, chill, jazz, classical, metal, latin, country, indie, blues, reggae, gospel
+
+Return this exact JSON shape:
 {
-  "filters": {
-    "energy": { "min": 0, "max": 1 },
-    "tempo": { "min": 60, "max": 200 },
-    "valence": { "min": 0, "max": 1 },
-    "danceability": { "min": 0, "max": 1 },
-    "acousticness": { "min": 0, "max": 1 },
-    "instrumentalness": { "min": 0, "max": 1 },
-    "speechiness": { "min": 0, "max": 1 }
-  },
-  "weights": {
-    "energy": 1,
-    "tempo": 1,
-    "valence": 1,
-    "danceability": 1,
-    "acousticness": 1,
-    "instrumentalness": 1,
-    "speechiness": 1
-  },
+  "keywords": ["keyword1", "keyword2"],
+  "targetGenres": ["cluster1", "cluster2"],
+  "artist": null,
   "label": "Short playlist name (3 words max)"
 }
 
-Only include filter features that are relevant to the query. Set weights higher (1.2–1.5) for the most important features.`;
+Rules:
+- keywords: 2–6 words that describe the mood/vibe (e.g. "dark", "sleep", "pump up")
+- targetGenres: 1–4 clusters that fit the query
+- artist: string if user explicitly named an artist, otherwise null
+- label: concise name for the resulting playlist`;
 
-async function parseWithLLM(query) {
+// ─────────────────────────────────────────────────────────────────────────────
+// LLM integrations
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function parseWithGemini(query) {
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
     {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: LLM_SYSTEM_PROMPT }] },
-        contents: [{ role: "user", parts: [{ text: query }] }],
-        generationConfig: { maxOutputTokens: 500, temperature: 0.2 },
+        contents: [{ role: 'user', parts: [{ text: query }] }],
+        generationConfig: { maxOutputTokens: 300, temperature: 0.2 },
       }),
     }
   );
 
-  if (!res.ok) throw new Error("Gemini LLM fallback failed");
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(`Gemini failed (${res.status}): ${err?.error?.message ?? 'unknown'}`);
+  }
 
   const data = await res.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
-  const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '{}';
+  return JSON.parse(text.replace(/```json|```/g, '').trim());
+}
+
+async function parseWithGroq(query) {
+  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: 'llama-3.3-70b-versatile',
+      temperature: 0.2,
+      max_tokens: 300,
+      messages: [
+        { role: 'system', content: LLM_SYSTEM_PROMPT },
+        { role: 'user', content: query },
+      ],
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(`Groq failed (${res.status}): ${err?.error?.message ?? 'unknown'}`);
+  }
+
+  const data = await res.json();
+  const text = data.choices?.[0]?.message?.content ?? '{}';
+  return JSON.parse(text.replace(/```json|```/g, '').trim());
+}
+
+async function parseWithLLM(query) {
+  let parsed = null;
+
+  try {
+    console.log('[intent] trying Gemini...');
+    parsed = await parseWithGemini(query);
+  } catch (geminiErr) {
+    console.warn('[intent] Gemini unavailable:', geminiErr.message, '→ falling back to Groq');
+    try {
+      parsed = await parseWithGroq(query);
+    } catch (groqErr) {
+      console.warn('[intent] Groq also unavailable:', groqErr.message);
+      // Both LLMs failed — return a safe generic intent
+      return {
+        keywords: expandKeywords([query]),
+        targetGenres: [],
+        artist: null,
+        label: 'Filtered Playlist',
+        source: 'fallback',
+      };
+    }
+  }
 
   return {
-    filters: parsed.filters ?? {},
-    weights: { ...DEFAULT_WEIGHTS, ...(parsed.weights ?? {}) },
-    label: parsed.label ?? "Filtered Playlist",
-    source: "llm",
+    keywords:     expandKeywords(parsed.keywords || [query]),
+    targetGenres: parsed.targetGenres || [],
+    artist:       parsed.artist || null,
+    label:        parsed.label || 'Filtered Playlist',
+    source:       'llm',
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Parse a natural language query into structured intent.
+ *
+ * @param {string} query - user's natural language input
+ * @returns {Promise<{
+ *   keywords: string[],
+ *   targetGenres: string[],
+ *   artist: string|null,
+ *   label: string,
+ *   source: string
+ * }>}
+ */
 async function parseIntent(query) {
   const ruleMatch = matchRules(query);
+
   if (ruleMatch) {
+    console.log(`[intent] rule match → "${ruleMatch.label}"`);
     return {
-      filters: ruleMatch.filters,
-      weights: { ...DEFAULT_WEIGHTS, ...ruleMatch.weights },
-      label: ruleMatch.label,
-      source: "rules",
+      keywords:     expandKeywords(ruleMatch.keywords),
+      targetGenres: ruleMatch.genres,
+      artist:       null,
+      label:        ruleMatch.label,
+      source:       'rules',
     };
   }
+
+  console.log('[intent] no rule match → falling back to LLM');
   return parseWithLLM(query);
 }
 
-module.exports = { parseIntent };
+module.exports = { parseIntent, matchRules, parseWithLLM };
