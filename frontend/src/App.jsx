@@ -10,6 +10,8 @@ const ProtectedRoute = ({ children }) => {
   return isAuthenticated ? children : <Navigate to="/login" />;
 };
 
+import PlaylistDetail from './pages/PlaylistDetail';
+
 const AppRoutes = () => {
   return (
     <Routes>
@@ -28,6 +30,14 @@ const AppRoutes = () => {
         element={
           <ProtectedRoute>
             <Dashboard />
+          </ProtectedRoute>
+        } 
+      />
+      <Route 
+        path="/playlist/:id" 
+        element={
+          <ProtectedRoute>
+            <PlaylistDetail />
           </ProtectedRoute>
         } 
       />

@@ -16,13 +16,19 @@ export const AuthProvider = ({ children }) => {
     setLoading(false);
   }, []);
 
-  const login = (token) => {
-    localStorage.setItem('spotify_access_token', token);
+  const login = ({ access_token, refresh_token }) => {
+    localStorage.setItem('spotify_access_token', access_token);
+    if (refresh_token) {
+      localStorage.setItem('spotify_refresh_token', refresh_token);
+    } else {
+      console.error("Refresh token missing");
+    }
     setIsAuthenticated(true);
   };
 
   const logout = () => {
     localStorage.removeItem('spotify_access_token');
+    localStorage.removeItem('spotify_refresh_token');
     setIsAuthenticated(false);
     navigate('/login');
   };

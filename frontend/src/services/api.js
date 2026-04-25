@@ -7,10 +7,17 @@ const api = axios.create({
 // Automatically attach Authorization header
 api.interceptors.request.use(
   (config) => {
-    const token = localStorage.getItem('spotify_access_token');
-    if (token) {
-      config.headers.Authorization = `Bearer ${token}`;
+    const accessToken = localStorage.getItem('spotify_access_token');
+    const refreshToken = localStorage.getItem('spotify_refresh_token');
+
+    if (accessToken) {
+      config.headers.Authorization = `Bearer ${accessToken}`;
     }
+
+    if (refreshToken) {
+      config.headers['x-refresh-token'] = refreshToken;
+    }
+
     return config;
   },
   (error) => {

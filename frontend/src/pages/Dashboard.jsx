@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useContext } from 'react';
+import { useNavigate, Link } from 'react-router-dom';
 import { AuthContext } from '../context/AuthContext';
 import api from '../services/api';
 
@@ -7,6 +8,7 @@ const Dashboard = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const { logout, isAuthenticated } = useContext(AuthContext);
+  const navigate = useNavigate();
 
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -14,7 +16,7 @@ const Dashboard = () => {
     const getPlaylists = async () => {
       try {
         const response = await api.get('/playlists');
-        setPlaylists(response.data.items || []);
+        setPlaylists(Array.isArray(response.data) ? response.data : (response.data.items || []));
         setLoading(false);
       } catch (err) {
         console.error('Failed to fetch playlists:', err);
@@ -41,17 +43,28 @@ const Dashboard = () => {
         </div>
         
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-6">
-          {playlists.map(playlist => (
-            <div key={playlist.id} className="bg-gray-800 p-4 rounded-lg shadow-lg hover:bg-gray-700 transition cursor-pointer">
-              {playlist.images && playlist.images.length > 0 ? (
-                <img src={playlist.images[0].url} alt={playlist.name} className="w-full aspect-square object-cover rounded-md mb-4 shadow-md" />
-              ) : (
-                <div className="w-full aspect-square bg-gray-600 rounded-md mb-4 flex items-center justify-center text-gray-400 shadow-md">No Image</div>
-              )}
-              <h2 className="text-lg font-semibold truncate mb-1" title={playlist.name}>{playlist.name}</h2>
-              <p className="text-sm text-gray-400">{playlist.tracks?.total || 0} tracks</p>
-            </div>
-          ))}
+          {playlists.map(playlist => {
+            // Handle both raw Spotify objects and custom mapped objects
+            const trackCount = typeof playlist.tracks === 'number' 
+              ? playlist.tracks 
+              : playlist.tracks?.total ?? playlist.trackCount ?? 0;
+              
+            return (
+              <Link 
+                to={`/playlist/${playlist.id}`}
+                key={playlist.id} 
+                className="bg-gray-800 p-4 rounded-lg shadow-lg hover:bg-gray-700 transition cursor-pointer hover:scale-[1.02] block"
+              >
+                {playlist.images && playlist.images.length > 0 ? (
+                  <img src={playlist.images[0].url} alt={playlist.name} className="w-full aspect-square object-cover rounded-md mb-4 shadow-md" />
+                ) : (
+                  <div className="w-full aspect-square bg-gray-600 rounded-md mb-4 flex items-center justify-center text-gray-400 shadow-md">No Image</div>
+                )}
+                <h2 className="text-lg font-semibold truncate mb-1" title={playlist.name}>{playlist.name}</h2>
+                <p className="text-sm text-gray-400">{trackCount} tracks</p>
+              </Link>
+            );
+          })}
           {playlists.length === 0 && (
             <div className="col-span-full text-center text-gray-400 py-12">
               You don't have any playlists yet.

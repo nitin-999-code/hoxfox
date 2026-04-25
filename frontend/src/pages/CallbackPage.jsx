@@ -24,10 +24,10 @@ const CallbackPage = () => {
     const exchangeCode = async () => {
       try {
         const response = await axios.post('http://localhost:5001/auth/callback', { code });
-        const { access_token } = response.data;
+        const { access_token, refresh_token } = response.data;
         
         if (access_token) {
-          login(access_token);
+          login({ access_token, refresh_token });
           navigate('/dashboard', { replace: true });
         } else {
           console.error('No access token received');
