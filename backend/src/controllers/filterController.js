@@ -1,112 +1,113 @@
-// Controllers for filtering logic
-const spotifyService = require('../services/spotifyService');
-const filterService = require('../services/filterService');
-const lastfmService = require('../services/lastfmService');
+// filterController.js
+const spotifyService      = require('../services/spotifyService');
+const lastfmService       = require('../services/lastfmService');
+const intentParser        = require('../services/intentParserService');
+const filterEngine        = require('../services/filterEngineService');
+const { normalizeTracks } = require('../utils/normalizeTrack');
 
 const filterPlaylist = async (req, res, next) => {
   try {
     const { playlistId, userQuery } = req.body;
-    if (!playlistId || !userQuery) {
+    if (!playlistId || !userQuery)
       return res.status(400).json({ error: 'playlistId and userQuery are required' });
-    }
-    
-    const authHeader = req.headers.authorization;
-    if (!authHeader) {
+
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token)
       return res.status(401).json({ error: 'Authorization header missing' });
-    }
-    
-    const token = authHeader.split(' ')[1];
-    
-    // Fetch all tracks from playlist
+
+    const intent = await intentParser.parseIntent(userQuery);
+    console.log('[filter] intent:', intent);
+
     const rawTracks = await spotifyService.getPlaylistTracks(playlistId, token, null);
-    
-    // Filter tracks
-    const matchingTrackIds = await filterService.filterTracks(token, rawTracks, userQuery);
-    
-    res.json({ matchingTrackIds });
+
+    const artistIds = [...new Set(
+      rawTracks.flatMap(t => t.track?.artists?.map(a => a.id) || [])
+    )].filter(Boolean);
+
+    const artistGenreMap = await spotifyService.getArtistGenresBatched(artistIds, token, null);
+
+    const normalizedTracks = normalizeTracks(rawTracks, artistGenreMap);
+
+    const seen = new Set();
+    const dedupedTracks = normalizedTracks.filter(t => {
+      if (seen.has(t.id)) return false;
+      seen.add(t.id);
+      return true;
+    });
+
+    const mappedForLastfm = dedupedTracks.map(t => ({
+      id:         t.id,
+      trackName:  t.name,
+      artistName: t.artists[0] || 'Unknown',
+    }));
+    const moodTagsMap = await lastfmService.getTrackTagsBatch(mappedForLastfm);
+
+    dedupedTracks.forEach(t => {
+      t.moodTags = moodTagsMap[t.id] || [];
+    });
+
+    const { tracks: scored, totalConsidered, relaxed } = filterEngine.filterTracks(
+      dedupedTracks,
+      intent
+    );
+
+    const matchingTrackIds = scored.map(s => s.track.id);
+
+    if (matchingTrackIds.length === 0) {
+      return res.json({
+        matchingTrackIds: [],
+        meta: {
+          intent,
+          totalConsidered,
+          matched: 0,
+          relaxed,
+          message: `No "${intent.label}" songs found in this playlist. Try a different mood or genre.`,
+        },
+      });
+    }
+
+    res.json({
+      matchingTrackIds,
+      meta: { intent, totalConsidered, matched: matchingTrackIds.length, relaxed },
+    });
+
   } catch (error) {
     next(error);
   }
 };
 
+// kept so the /debug route doesn't break
 const debugFilter = async (req, res, next) => {
   try {
-    const { playlistId, userQuery } = req.body;
-    if (!playlistId) {
+    const { playlistId } = req.body;
+    if (!playlistId)
       return res.status(400).json({ error: 'playlistId is required' });
-    }
-    
-    const authHeader = req.headers.authorization;
-    if (!authHeader) {
+
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token)
       return res.status(401).json({ error: 'Authorization header missing' });
-    }
-    
-    const token = authHeader.split(' ')[1];
-    
-    // Fetch all tracks from playlist
+
     const rawTracks = await spotifyService.getPlaylistTracks(playlistId, token, null);
 
-    const uniqueArtistIds = [...new Set(rawTracks.flatMap(t => t.track?.artists?.map(a => a.id) || []))].filter(Boolean);
-    const mappedTracks = rawTracks.map(t => ({
-      id: t.track?.id,
-      trackName: t.track?.name,
-      artistName: t.track?.artists?.[0]?.name || 'Unknown'
-    })).filter(t => t.id);
+    const artistIds = [...new Set(
+      rawTracks.flatMap(t => t.track?.artists?.map(a => a.id) || [])
+    )].filter(Boolean);
 
-    // Step 1 - Fetch Data In Parallel
-    const [artistGenres, trackTagsMap] = await Promise.all([
-      spotifyService.getArtistGenresBatched ? spotifyService.getArtistGenresBatched(uniqueArtistIds, token, null).then(map => Object.keys(map).map(id => ({ id, genres: map[id] }))) : spotifyService.getArtistGenres(token, uniqueArtistIds),
-      lastfmService.getTrackTagsBatch(mappedTracks)
-    ]);
-    
-    const genreMap = {};
-    artistGenres.forEach(ag => {
-      genreMap[ag.id] = ag.genres || [];
-    });
+    const artistGenreMap = await spotifyService.getArtistGenresBatched(artistIds, token, null);
+    const normalizedTracks = normalizeTracks(rawTracks, artistGenreMap);
 
-    // Step 2 - Enrich Each Track
-    const enrichedTracks = mappedTracks.map(t => {
-      let genres = [];
-      const originalTrack = rawTracks.find(raw => raw.track?.id === t.id);
-      if (originalTrack && originalTrack.track && originalTrack.track.artists) {
-        originalTrack.track.artists.forEach(a => {
-          if (genreMap[a.id]) {
-            genres.push(...genreMap[a.id]);
-          }
-        });
-      }
-      genres = [...new Set(genres)];
-      
-      const lastfmTags = trackTagsMap[t.id] || [];
-      
-      let confidence = 0;
-      if (genres.length > 0) confidence += 40;
-      if (genres.length > 3) confidence += 20;
-      if (lastfmTags.length > 0) confidence += 30;
-      if (lastfmTags.length > 5) confidence += 10;
-      
-      const bucket = confidence >= 50 ? "highConfidence" : "lowConfidence";
-
-      return {
-        id: t.id,
-        trackName: t.trackName,
-        artistName: t.artistName,
-        genres,
-        lastfmTags,
-        confidence,
-        bucket
-      };
-    });
-
-    const highConfidenceCount = enrichedTracks.filter(t => t.bucket === "highConfidence").length;
-    const lowConfidenceCount = enrichedTracks.filter(t => t.bucket === "lowConfidence").length;
+    const mappedForLastfm = normalizedTracks.map(t => ({
+      id: t.id, trackName: t.name, artistName: t.artists[0] || 'Unknown',
+    }));
+    const moodTagsMap = await lastfmService.getTrackTagsBatch(mappedForLastfm);
+    normalizedTracks.forEach(t => { t.moodTags = moodTagsMap[t.id] || []; });
 
     res.json({
-      totalTracks: enrichedTracks.length,
-      highConfidenceCount,
-      lowConfidenceCount,
-      userQuery,
-      tracks: enrichedTracks
+      totalTracks: normalizedTracks.length,
+      tracks: normalizedTracks.map(t => ({
+        id: t.id, name: t.name, artists: t.artists,
+        genres: t.genres, clusters: t.clusters, moodTags: t.moodTags,
+      })),
     });
   } catch (error) {
     next(error);
@@ -115,5 +116,5 @@ const debugFilter = async (req, res, next) => {
 
 module.exports = {
   filterPlaylist,
-  debugFilter
+  debugFilter,
 };

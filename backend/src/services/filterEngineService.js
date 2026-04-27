@@ -291,8 +291,7 @@ function filterTracks(tracks, intent, options = {}) {
 
     // Last resort: top N by raw score, no threshold
     if (filtered.length < MIN_RESULTS) {
-      console.log('[filter] still too few — using top-N fallback');
-      filtered = [...scored].sort((a, b) => b.score - a.score).slice(0, topN);
+      console.log('[filter] still too few — returning what we have, no forced fallback');
     }
   }
 
