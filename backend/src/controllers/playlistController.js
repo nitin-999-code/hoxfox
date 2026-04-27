@@ -1,29 +1,25 @@
 /**
  * playlistController.js
- * Handles all playlist-related HTTP endpoints.
  *
- * filterPlaylist implements the full pipeline:
- *   1. Fetch playlist tracks
- *   2. Collect artist IDs → batch-fetch genres (no audio-features API)
- *   3. Normalize tracks into canonical shape
- *   4. Parse user intent (rule-based → LLM fallback)
- *   5. Score, rank, apply diversity filter
- *   6. Return enriched results + explainability metadata
+ * filterPlaylist pipeline:
+ *   1. Fetch playlist tracks (paginated)
+ *   2. Batch-fetch Spotify artist genres (50/req, cached)
+ *   3. Normalize tracks → NormalizedTrack[]
+ *   4. Fetch Last.fm mood tags (rate-limited, enriches each track.moodTags)
+ *   5. Parse user intent → { keywords, targetGenres, language, artist, label }
+ *   6. Score, rank, diversity filter, fallback
+ *   7. (Optional) create new Spotify playlist with filtered tracks
+ *   8. Return
  */
 
 const spotifyService  = require('../services/spotifyService');
+const lastfmService   = require('../services/lastfmService');
 const { parseIntent } = require('../services/intentParserService');
 const { filterTracks } = require('../services/filterEngineService');
 const { normalizeTracks } = require('../utils/normalizeTrack');
 
-// ── Token helpers ──────────────────────────────────────────────────────────
-const extractToken = (req) => {
-  const token = req.headers.authorization?.split(' ')[1];
-  if (!token) throw new Error('Missing token');
-  return token;
-};
-
-const extractRefreshToken = (req) => req.headers['x-refresh-token'] || null;
+const extractToken        = req => { const t = req.headers.authorization?.split(' ')[1]; if (!t) throw new Error('Missing token'); return t; };
+const extractRefreshToken = req => req.headers['x-refresh-token'] || null;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /playlists
@@ -34,9 +30,9 @@ exports.getPlaylists = async (req, res) => {
     const refreshToken = extractRefreshToken(req);
     const playlists    = await spotifyService.getUserPlaylists(token, refreshToken);
     res.json(playlists);
-  } catch (error) {
-    console.error('[getPlaylists] error:', error.response?.data || error.message);
-    if (error.message === 'Missing token') return res.status(401).json({ error: 'Missing token' });
+  } catch (err) {
+    console.error('[getPlaylists]', err.response?.data || err.message);
+    if (err.message === 'Missing token') return res.status(401).json({ error: 'Missing token' });
     res.status(500).json({ error: 'Failed to fetch playlists' });
   }
 };
@@ -48,13 +44,12 @@ exports.getPlaylistTracks = async (req, res) => {
   try {
     const token        = extractToken(req);
     const refreshToken = extractRefreshToken(req);
-    const playlistId   = req.params.id;
-    const tracks       = await spotifyService.getPlaylistTracks(playlistId, token, refreshToken);
+    const tracks       = await spotifyService.getPlaylistTracks(req.params.id, token, refreshToken);
     res.json(tracks);
-  } catch (error) {
-    console.error('[getPlaylistTracks] error:', error.response?.data || error.message);
-    if (error.message === 'Missing token') return res.status(401).json({ error: 'Missing token' });
-    res.status(500).json({ error: 'Failed to fetch tracks: ' + (error.response?.data?.error?.message || error.message) });
+  } catch (err) {
+    console.error('[getPlaylistTracks]', err.response?.data || err.message);
+    if (err.message === 'Missing token') return res.status(401).json({ error: 'Missing token' });
+    res.status(500).json({ error: 'Failed to fetch tracks: ' + (err.response?.data?.error?.message || err.message) });
   }
 };
 
@@ -69,9 +64,9 @@ exports.createPlaylist = async (req, res) => {
     if (!userId || !name) return res.status(400).json({ error: 'userId and name are required' });
     const data = await spotifyService.createPlaylist(userId, name, token, refreshToken);
     res.json(data);
-  } catch (error) {
-    console.error('[createPlaylist] error:', error.response?.data || error.message);
-    if (error.message === 'Missing token') return res.status(401).json({ error: 'Missing token' });
+  } catch (err) {
+    console.error('[createPlaylist]', err.response?.data || err.message);
+    if (err.message === 'Missing token') return res.status(401).json({ error: 'Missing token' });
     res.status(500).json({ error: 'Failed to create playlist' });
   }
 };
@@ -89,27 +84,16 @@ exports.addTracksToPlaylist = async (req, res) => {
     }
     const data = await spotifyService.addTracksToPlaylist(playlistId, uris, token, refreshToken);
     res.json(data);
-  } catch (error) {
-    console.error('[addTracksToPlaylist] error:', error.response?.data || error.message);
-    if (error.message === 'Missing token') return res.status(401).json({ error: 'Missing token' });
+  } catch (err) {
+    console.error('[addTracksToPlaylist]', err.response?.data || err.message);
+    if (err.message === 'Missing token') return res.status(401).json({ error: 'Missing token' });
     res.status(500).json({ error: 'Failed to add tracks to playlist' });
   }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /playlists/filter    ← MAIN ENDPOINT
-//
-// Body: { playlistId, query, topN?, maxPerArtist?, createPlaylist? }
-// Headers: Authorization: Bearer <token>, x-refresh-token: <token>
-//
-// Pipeline:
-//   1. Fetch all playlist tracks (paginated)
-//   2. Collect unique artist IDs → batch-fetch genres (cached, batches of 50)
-//   3. Normalize tracks: { id, name, artists, genres, clusters, popularity, … }
-//   4. Parse intent: rule-based → LLM fallback
-//   5. Score + rank + diversity + fallback
-//   6. (Optional) create new playlist and add filtered tracks
-//   7. Return
+// POST /playlists/filter  ← MAIN ENDPOINT
+// Body: { playlistId, query, topN?, maxPerArtist?, userId?, createNewPlaylist? }
 // ─────────────────────────────────────────────────────────────────────────────
 exports.filterPlaylist = async (req, res) => {
   try {
@@ -118,9 +102,9 @@ exports.filterPlaylist = async (req, res) => {
     const {
       playlistId,
       query,
-      topN         = 30,
-      maxPerArtist = 3,
-      userId,             // needed if createNewPlaylist is true
+      topN             = 30,
+      maxPerArtist     = 3,
+      userId,
       createNewPlaylist = false,
     } = req.body;
 
@@ -128,121 +112,116 @@ exports.filterPlaylist = async (req, res) => {
       return res.status(400).json({ error: 'playlistId and query are required' });
     }
 
-    console.log(`[filterPlaylist] playlist=${playlistId} query="${query}"`);
+    console.log(`[filter] playlist=${playlistId} query="${query}"`);
 
-    // ── Step 1: Fetch all tracks ───────────────────────────────────────────
-    const rawItems = await spotifyService.getPlaylistTracks(playlistId, token, refreshToken);
+    // ── Step 1: Fetch tracks ────────────────────────────────────────────────
+    const rawItems  = await spotifyService.getPlaylistTracks(playlistId, token, refreshToken);
     const rawTracks = rawItems
       .map(item => item.track || item)
-      .filter(t => t && t.id && t.id !== 'local'); // drop null + local tracks
+      .filter(t => t && t.id && t.id !== 'local');
 
     if (rawTracks.length === 0) {
       return res.status(404).json({ error: 'Playlist is empty or has no playable tracks' });
     }
+    console.log(`[filter] ${rawTracks.length} raw tracks`);
 
-    console.log(`[filterPlaylist] ${rawTracks.length} raw tracks`);
-
-    // ── Step 2: Collect unique artist IDs ────────────────────────────────
+    // ── Step 2: Artist genres ───────────────────────────────────────────────
     const allArtistIds = [...new Set(
       rawTracks.flatMap(t => (t.artists || []).map(a => a.id).filter(Boolean))
     )];
 
-    console.log(`[filterPlaylist] ${allArtistIds.length} unique artists — fetching genres...`);
+    const artistGenreMap = await spotifyService.getArtistGenresBatched(allArtistIds, token, refreshToken);
+    const covered = Object.values(artistGenreMap).filter(g => g.length > 0).length;
+    console.log(`[filter] genres for ${covered}/${allArtistIds.length} artists`);
 
-    // Batch-fetch genres (50/request, in-memory LRU cached)
-    const artistGenreMap = await spotifyService.getArtistGenresBatched(
-      allArtistIds, token, refreshToken
-    );
+    // ── Step 3: Normalize ───────────────────────────────────────────────────
+    const normalized = normalizeTracks(rawItems, artistGenreMap);
 
-    const totalGenresCovered = Object.values(artistGenreMap).filter(g => g.length > 0).length;
-    console.log(`[filterPlaylist] genres fetched for ${totalGenresCovered}/${allArtistIds.length} artists`);
-
-    // ── Step 3: Normalize tracks ──────────────────────────────────────────
-    const normalizedTracks = normalizeTracks(rawItems, artistGenreMap);
-
-    // Deduplicate by track ID (playlist can have duplicates)
+    // Deduplicate by track ID
     const seen = new Set();
-    const uniqueTracks = normalizedTracks.filter(t => {
+    const unique = normalized.filter(t => {
       if (seen.has(t.id)) return false;
       seen.add(t.id);
       return true;
     });
+    console.log(`[filter] ${unique.length} unique normalized tracks`);
 
-    console.log(`[filterPlaylist] ${uniqueTracks.length} unique normalized tracks`);
+    // ── Step 4: Last.fm mood tags ───────────────────────────────────────────
+    const forLastfm = unique.map(t => ({
+      id:         t.id,
+      trackName:  t.name,
+      artistName: t.artists[0] || 'Unknown',
+    }));
 
-    // ── Step 4: Parse intent ──────────────────────────────────────────────
+    const moodTagsMap = await lastfmService.getTrackTagsBatch(forLastfm);
+
+    // Attach mood tags to each normalized track (mutates a copy)
+    const enriched = unique.map(t => ({ ...t, moodTags: moodTagsMap[t.id] || [] }));
+
+    const tracksWithTags = enriched.filter(t => t.moodTags.length > 0).length;
+    console.log(`[filter] ${tracksWithTags}/${enriched.length} tracks enriched with mood tags`);
+
+    // ── Step 5: Parse intent ────────────────────────────────────────────────
     const intent = await parseIntent(query);
-    console.log(`[filterPlaylist] intent="${intent.label}" source=${intent.source} genres=${intent.targetGenres.join(',')}`);
+    console.log(`[filter] intent="${intent.label}" source=${intent.source} genres=[${intent.targetGenres}] lang=${intent.language}`);
 
-    // ── Step 5: Score, rank, diversity, fallback ──────────────────────────
-    const result = filterTracks(uniqueTracks, intent, { topN, maxPerArtist });
+    // ── Step 6: Score, rank, diversity ─────────────────────────────────────
+    const result = filterTracks(enriched, intent, { topN, maxPerArtist });
+    console.log(`[filter] ${result.tracks.length} tracks selected (relaxed=${result.relaxed})`);
 
-    console.log(`[filterPlaylist] ${result.tracks.length} tracks selected (relaxed=${result.relaxed})`);
-
-    // ── Step 6 (optional): Create new Spotify playlist ───────────────────
+    // ── Step 7 (optional): Create new playlist ──────────────────────────────
     let newPlaylistId = null;
     if (createNewPlaylist && userId) {
-      const playlistName = `${intent.label} — hoxfox`;
-      const newPl = await spotifyService.createPlaylist(userId, playlistName, token, refreshToken);
+      const name  = `${intent.label} — hoxfox`;
+      const newPl = await spotifyService.createPlaylist(userId, name, token, refreshToken);
       newPlaylistId = newPl.id;
 
-      const uris = result.tracks
-        .map(s => s.track.uri)
-        .filter(Boolean);
-
-      // Spotify accepts max 100 URIs per add request
+      const uris = result.tracks.map(s => s.track.uri).filter(Boolean);
       for (let i = 0; i < uris.length; i += 100) {
-        await spotifyService.addTracksToPlaylist(
-          newPlaylistId,
-          uris.slice(i, i + 100),
-          token,
-          refreshToken
-        );
+        await spotifyService.addTracksToPlaylist(newPlaylistId, uris.slice(i, i + 100), token, refreshToken);
       }
-      console.log(`[filterPlaylist] Created new playlist: ${newPlaylistId}`);
+      console.log(`[filter] created new playlist: ${newPlaylistId}`);
     }
 
-    // ── Step 7: Return ────────────────────────────────────────────────────
+    // ── Step 8: Respond ─────────────────────────────────────────────────────
     return res.json({
-      label:            intent.label,
-      intentSource:     intent.source,
+      label:           intent.label,
+      intentSource:    intent.source,
       intent: {
         keywords:     intent.keywords,
         targetGenres: intent.targetGenres,
+        language:     intent.language,
         artist:       intent.artist,
       },
-      totalConsidered:  result.totalConsidered,
-      totalReturned:    result.tracks.length,
-      relaxed:          result.relaxed,
+      totalConsidered: result.totalConsidered,
+      totalReturned:   result.tracks.length,
+      relaxed:         result.relaxed,
       newPlaylistId,
       tracks: result.tracks.map(s => ({
-        id:           s.track.id,
-        uri:          s.track.uri,
-        name:         s.track.name,
-        artists:      s.track.artists,
-        genres:       s.track.genres,
-        clusters:     s.track.clusters,
-        popularity:   s.track.popularity,
-        durationMs:   s.track.durationMs,
-        album:        s.track.album,
-        score:        Math.round(s.score),
-        matchReasons: s.matchReasons,
+        id:             s.track.id,
+        uri:            s.track.uri,
+        name:           s.track.name,
+        artists:        s.track.artists,
+        genres:         s.track.genres,
+        clusters:       s.track.clusters,
+        moodTags:       s.track.moodTags,
+        popularity:     s.track.popularity,
+        durationMs:     s.track.durationMs,
+        album:          s.track.album,
+        score:          Math.round(s.score),
+        matchReasons:   s.matchReasons,
         scoreBreakdown: s.components,
       })),
     });
 
-  } catch (error) {
-    console.error('[filterPlaylist] error:', error.response?.data || error.message);
-    if (error.message === 'Missing token') return res.status(401).json({ error: 'Missing token' });
-    res.status(500).json({ error: error.message || 'Failed to filter playlist' });
+  } catch (err) {
+    console.error('[filterPlaylist] error:', err.response?.data || err.message);
+    if (err.message === 'Missing token') return res.status(401).json({ error: 'Missing token' });
+    res.status(500).json({ error: err.message || 'Failed to filter playlist' });
   }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /playlists/audio-features  (kept for backwards compat, returns 410)
-// ─────────────────────────────────────────────────────────────────────────────
+// Kept for backwards compat — audio-features endpoint is gone from Spotify
 exports.getAudioFeatures = async (req, res) => {
-  res.status(410).json({
-    error: 'audio-features endpoint is no longer used. Use /playlists/filter instead.',
-  });
+  res.status(410).json({ error: 'audio-features is no longer available. Use /playlists/filter.' });
 };

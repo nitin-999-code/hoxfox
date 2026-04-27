@@ -1,220 +1,243 @@
 /**
  * intentParserService.js
- * Converts a natural language query → structured intent.
+ * Natural language query → structured intent for the filter engine.
  *
  * Output shape:
  * {
- *   keywords:     string[],   // expanded with synonyms, used for fuzzy name matching
- *   targetGenres: string[],   // cluster names (e.g. 'chill', 'hip-hop')
- *   artist:       string|null,// explicit artist name if mentioned
- *   label:        string,     // human-readable playlist label
- *   source:       'rules'|'llm'
+ *   keywords:     string[],    // expanded synonyms, used for name/tag matching
+ *   targetGenres: string[],    // cluster names from genreClusters.js
+ *   artist:       string|null,
+ *   language:     string|null, // 'hindi' | 'punjabi' | 'korean' | 'spanish' | 'english' | null
+ *   label:        string,
+ *   source:       'rules' | 'llm' | 'fallback'
  * }
- *
- * Strategy:
- *   1. Rule-based matcher handles 90% of common queries (zero latency, no API cost)
- *   2. Gemini LLM fallback for complex / ambiguous queries
- *   3. Groq (llama-3.3-70b) second fallback if Gemini unavailable
- *
- * IMPORTANT: LLM is ONLY used for intent parsing.
- *            Track data / playlist content is NEVER sent to the LLM.
  */
 
 const { expandKeywords } = require('../utils/synonyms');
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Rule table: keyword triggers → { keywords, genres, label }
-// keywords here are ROOT words — they get synonym-expanded before scoring
-// genres must be cluster names from genreClusters.js
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Rule table ────────────────────────────────────────────────────────────────
+// language field is optional — only set for language-specific rules
 const RULES = [
+  // Moods / activity
   {
-    triggers:  ['sleep', 'bedtime', 'lullaby', 'wind down', 'insomnia'],
-    keywords:  ['sleep', 'night', 'calm', 'relax', 'soft'],
-    genres:    ['chill', 'classical', 'indie'],
-    label:     'Sleep & Wind Down',
+    triggers: ['sleep', 'bedtime', 'lullaby', 'wind down', 'insomnia'],
+    keywords: ['sleep', 'night', 'calm', 'relax', 'soft'],
+    genres:   ['chill', 'classical', 'indie'],
+    label:    'Sleep & Wind Down',
   },
   {
-    triggers:  ['workout', 'gym', 'exercise', 'run', 'running', 'beast mode', 'pump up'],
-    keywords:  ['workout', 'energy', 'pump', 'power', 'loud'],
-    genres:    ['hip-hop', 'pop', 'rock', 'electronic', 'metal'],
-    label:     'Workout Energy',
+    triggers: ['workout', 'gym', 'exercise', 'run', 'running', 'beast mode', 'pump up'],
+    keywords: ['workout', 'energy', 'pump', 'power', 'loud'],
+    genres:   ['hip-hop', 'pop', 'rock', 'electronic', 'metal'],
+    label:    'Workout Energy',
   },
   {
-    triggers:  ['happy', 'feel good', 'joyful', 'upbeat', 'good mood', 'cheerful', 'positive'],
-    keywords:  ['happy', 'joy', 'upbeat', 'bright'],
-    genres:    ['pop', 'rnb', 'latin', 'indie'],
-    label:     'Happy Vibes',
+    triggers: ['happy', 'feel good', 'joyful', 'upbeat', 'good mood', 'cheerful', 'positive'],
+    keywords: ['happy', 'joy', 'upbeat', 'bright'],
+    genres:   ['pop', 'rnb', 'latin', 'indie'],
+    label:    'Happy Vibes',
   },
   {
-    triggers:  ['sad', 'heartbreak', 'cry', 'melancholy', 'depressed', 'breakup', 'emotional'],
-    keywords:  ['sad', 'heartbreak', 'emotional', 'lonely'],
-    genres:    ['indie', 'rnb', 'pop', 'blues'],
-    label:     'Sad & Emotional',
+    triggers: ['sad', 'heartbreak', 'cry', 'melancholy', 'depressed', 'breakup', 'emotional'],
+    keywords: ['sad', 'heartbreak', 'emotional', 'lonely'],
+    genres:   ['indie', 'rnb', 'pop', 'blues'],
+    label:    'Sad & Emotional',
   },
   {
-    triggers:  ['chill', 'lofi', 'lo-fi', 'study', 'focus', 'background', 'reading', 'coffee'],
-    keywords:  ['chill', 'study', 'focus', 'relax'],
-    genres:    ['chill', 'indie', 'jazz', 'classical'],
-    label:     'Chill & Focus',
+    triggers: ['chill', 'lofi', 'lo-fi', 'study', 'focus', 'background', 'reading', 'coffee'],
+    keywords: ['chill', 'study', 'focus', 'relax'],
+    genres:   ['chill', 'indie', 'jazz', 'classical'],
+    label:    'Chill & Focus',
   },
   {
-    triggers:  ['party', 'dance', 'club', 'night out', 'banger', 'hype', 'rave', 'festival'],
-    keywords:  ['party', 'dance', 'hype', 'loud'],
-    genres:    ['electronic', 'pop', 'hip-hop', 'latin'],
-    label:     'Party & Dance',
+    triggers: ['party', 'dance', 'club', 'night out', 'banger', 'hype', 'rave', 'festival'],
+    keywords: ['party', 'dance', 'hype', 'loud'],
+    genres:   ['electronic', 'pop', 'hip-hop', 'latin'],
+    label:    'Party & Dance',
   },
   {
-    triggers:  ['acoustic', 'unplugged', 'raw', 'stripped'],
-    keywords:  ['acoustic', 'guitar', 'raw', 'stripped'],
-    genres:    ['indie', 'country', 'blues', 'folk'],
-    label:     'Acoustic Vibes',
+    triggers: ['acoustic', 'unplugged', 'raw', 'stripped'],
+    keywords: ['acoustic', 'guitar', 'raw', 'stripped'],
+    genres:   ['indie', 'country', 'blues', 'folk'],
+    label:    'Acoustic Vibes',
   },
   {
-    triggers:  ['instrumental', 'no vocals', 'ambient', 'meditation', 'mindful'],
-    keywords:  ['instrumental', 'ambient', 'peaceful'],
-    genres:    ['classical', 'chill', 'jazz', 'electronic'],
-    label:     'Instrumental',
+    triggers: ['instrumental', 'no vocals', 'ambient', 'meditation', 'mindful'],
+    keywords: ['instrumental', 'ambient', 'peaceful'],
+    genres:   ['classical', 'chill', 'jazz', 'electronic'],
+    label:    'Instrumental',
   },
   {
-    triggers:  ['morning', 'wake up', 'sunrise', 'fresh', 'start the day'],
-    keywords:  ['morning', 'fresh', 'energize'],
-    genres:    ['pop', 'indie', 'rnb'],
-    label:     'Morning Energy',
+    triggers: ['morning', 'wake up', 'sunrise', 'fresh', 'start the day'],
+    keywords: ['morning', 'fresh', 'energize'],
+    genres:   ['pop', 'indie', 'rnb'],
+    label:    'Morning Energy',
   },
   {
-    triggers:  ['rap', 'hip hop', 'hiphop', 'hip-hop', 'trap', 'bars', 'drill'],
-    keywords:  ['rap', 'hip hop', 'trap', 'bars'],
-    genres:    ['hip-hop'],
-    label:     'Rap & Hip-Hop',
+    triggers: ['rap', 'hip hop', 'hiphop', 'hip-hop', 'trap', 'bars', 'drill'],
+    keywords: ['rap', 'hip hop', 'trap', 'bars'],
+    genres:   ['hip-hop'],
+    label:    'Rap & Hip-Hop',
   },
   {
-    triggers:  ['rock', 'alternative', 'alt rock', 'guitar', 'punk', 'grunge'],
-    keywords:  ['rock', 'guitar', 'loud', 'electric'],
-    genres:    ['rock', 'metal', 'indie'],
-    label:     'Rock & Alternative',
+    triggers: ['rock', 'alternative', 'alt rock', 'guitar', 'punk', 'grunge'],
+    keywords: ['rock', 'guitar', 'loud', 'electric'],
+    genres:   ['rock', 'metal', 'indie'],
+    label:    'Rock & Alternative',
   },
   {
-    triggers:  ['jazz', 'blues', 'swing', 'bebop'],
-    keywords:  ['jazz', 'improvisation', 'swing'],
-    genres:    ['jazz', 'blues'],
-    label:     'Jazz & Blues',
+    triggers: ['jazz', 'blues', 'swing', 'bebop'],
+    keywords: ['jazz', 'improvisation', 'swing'],
+    genres:   ['jazz', 'blues'],
+    label:    'Jazz & Blues',
   },
   {
-    triggers:  ['classical', 'orchestra', 'symphony', 'piano', 'violin'],
-    keywords:  ['classical', 'orchestral', 'piano'],
-    genres:    ['classical'],
-    label:     'Classical',
+    triggers: ['classical', 'orchestra', 'symphony', 'piano', 'violin'],
+    keywords: ['classical', 'orchestral', 'piano'],
+    genres:   ['classical'],
+    label:    'Classical',
   },
   {
-    triggers:  ['latin', 'reggaeton', 'salsa', 'bachata', 'afrobeats', 'dancehall'],
-    keywords:  ['latin', 'dance', 'rhythm'],
-    genres:    ['latin', 'reggae'],
-    label:     'Latin & Afro',
+    triggers: ['latin', 'reggaeton', 'salsa', 'bachata', 'afrobeats', 'dancehall'],
+    keywords: ['latin', 'dance', 'rhythm'],
+    genres:   ['latin', 'reggae'],
+    label:    'Latin & Afro',
   },
   {
-    triggers:  ['metal', 'heavy', 'death metal', 'thrash', 'hardcore', 'screamo'],
-    keywords:  ['metal', 'heavy', 'intense', 'dark'],
-    genres:    ['metal', 'rock'],
-    label:     'Metal & Heavy',
+    triggers: ['metal', 'heavy', 'death metal', 'thrash', 'hardcore', 'screamo'],
+    keywords: ['metal', 'heavy', 'intense', 'dark'],
+    genres:   ['metal', 'rock'],
+    label:    'Metal & Heavy',
   },
   {
-    triggers:  ['rnb', 'r&b', 'soul', 'neo soul', 'funk', 'groove'],
-    keywords:  ['soul', 'groove', 'smooth', 'rhythm'],
-    genres:    ['rnb'],
-    label:     'R&B & Soul',
+    triggers: ['rnb', 'r&b', 'soul', 'neo soul', 'funk', 'groove'],
+    keywords: ['soul', 'groove', 'smooth', 'rhythm'],
+    genres:   ['rnb'],
+    label:    'R&B & Soul',
   },
   {
-    triggers:  ['romantic', 'love', 'passion', 'date night', 'intimate'],
-    keywords:  ['romantic', 'love', 'tender', 'sweet'],
-    genres:    ['rnb', 'pop', 'jazz', 'indie'],
-    label:     'Romantic Mood',
+    triggers: ['romantic', 'love', 'passion', 'date night', 'intimate'],
+    keywords: ['romantic', 'love', 'tender', 'sweet'],
+    genres:   ['rnb', 'pop', 'jazz', 'indie'],
+    label:    'Romantic Mood',
   },
   {
-    triggers:  ['dark', 'moody', 'gloomy', 'brooding', 'gothic'],
-    keywords:  ['dark', 'moody', 'gloomy', 'ominous'],
-    genres:    ['electronic', 'metal', 'indie', 'rock'],
-    label:     'Dark & Moody',
+    triggers: ['dark', 'moody', 'gloomy', 'brooding', 'gothic'],
+    keywords: ['dark', 'moody', 'gloomy', 'ominous'],
+    genres:   ['electronic', 'metal', 'indie', 'rock'],
+    label:    'Dark & Moody',
   },
   {
-    triggers:  ['nostalgic', 'throwback', 'retro', '80s', '90s', 'old school', 'classic'],
-    keywords:  ['nostalgic', 'throwback', 'retro', 'classic'],
-    genres:    ['pop', 'rock', 'rnb', 'hip-hop'],
-    label:     'Throwback',
+    triggers: ['nostalgic', 'throwback', 'retro', '80s', '90s', 'old school', 'classic'],
+    keywords: ['nostalgic', 'throwback', 'retro', 'classic'],
+    genres:   ['pop', 'rock', 'rnb', 'hip-hop'],
+    label:    'Throwback',
   },
   {
-    triggers:  ['drive', 'road trip', 'cruising', 'night drive', 'car'],
-    keywords:  ['drive', 'night', 'cruising', 'highway'],
-    genres:    ['pop', 'rock', 'electronic', 'indie'],
-    label:     'Late Night Drive',
+    triggers: ['drive', 'road trip', 'cruising', 'night drive', 'car'],
+    keywords: ['drive', 'night', 'cruising', 'highway'],
+    genres:   ['pop', 'rock', 'electronic', 'indie'],
+    label:    'Late Night Drive',
+  },
+
+  // ── Language / regional rules ─────────────────────────────────────────────
+  {
+    triggers:  ['hindi', 'bollywood', 'hindi songs', 'desi'],
+    keywords:  ['hindi', 'bollywood', 'filmi', 'desi'],
+    genres:    ['bollywood'],
+    label:     'Hindi / Bollywood',
+    language:  'hindi',
+  },
+  {
+    triggers:  ['punjabi', 'bhangra'],
+    keywords:  ['punjabi', 'bhangra', 'desi'],
+    genres:    ['punjabi', 'bollywood'],
+    label:     'Punjabi',
+    language:  'punjabi',
+  },
+  {
+    triggers:  ['korean', 'k-pop', 'kpop'],
+    keywords:  ['korean', 'k-pop'],
+    genres:    ['kpop'],
+    label:     'K-Pop',
+    language:  'korean',
+  },
+  {
+    triggers:  ['spanish', 'spanish songs'],
+    keywords:  ['spanish', 'latin'],
+    genres:    ['latin'],
+    label:     'Spanish / Latin',
+    language:  'spanish',
+  },
+  {
+    triggers:  ['english songs', 'english only', 'english'],
+    keywords:  ['english'],
+    genres:    ['pop', 'rock', 'hip-hop', 'indie', 'rnb'],
+    label:     'English Songs',
+    language:  'english',
   },
 ];
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Rule matching
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Rule matcher ──────────────────────────────────────────────────────────────
 
-/**
- * Try to match a query against the rule table.
- * Returns the best-scoring rule or null.
- */
 function matchRules(query) {
   const q = query.toLowerCase();
-  let best = null;
+  let best      = null;
   let bestScore = 0;
 
   for (const rule of RULES) {
     const score = rule.triggers.filter(t => q.includes(t)).length;
     if (score > bestScore) {
       bestScore = score;
-      best = rule;
+      best      = rule;
     }
   }
 
   return bestScore > 0 ? best : null;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// LLM system prompt — genre + keyword output (NOT audio features)
-// ─────────────────────────────────────────────────────────────────────────────
-const LLM_SYSTEM_PROMPT = `You are a music intent parser. Given a user's natural language query about music mood or genre, return a JSON object that describes WHAT KIND of music to look for — by keywords and genre clusters.
+// ── LLM system prompt ─────────────────────────────────────────────────────────
+
+const LLM_SYSTEM_PROMPT = `You are a music intent parser. Given a user's natural language query about music mood or genre, return a JSON object describing WHAT KIND of music to look for.
 
 IMPORTANT:
 - Do NOT return audio feature ranges (energy, tempo, valence, etc.).
-- Do NOT include any playlist track data.
-- Output ONLY raw JSON, no markdown, no explanation.
+- Output ONLY raw JSON — no markdown, no explanation.
 
-Available genre clusters (use ONLY these values in targetGenres):
-pop, hip-hop, rnb, rock, electronic, chill, jazz, classical, metal, latin, country, indie, blues, reggae, gospel
+Available genre clusters (use ONLY these in targetGenres):
+pop, hip-hop, rnb, rock, electronic, chill, jazz, classical, metal, latin, country, indie, blues, reggae, gospel, bollywood, punjabi, kpop
 
-Return this exact JSON shape:
+Available language values (use ONLY these, or null):
+hindi, punjabi, korean, spanish, english, null
+
+Return this exact shape:
 {
   "keywords": ["keyword1", "keyword2"],
   "targetGenres": ["cluster1", "cluster2"],
   "artist": null,
-  "label": "Short playlist name (3 words max)"
+  "language": null,
+  "label": "Short playlist name"
 }
 
 Rules:
-- keywords: 2–6 words that describe the mood/vibe (e.g. "dark", "sleep", "pump up")
+- keywords: 3–8 mood/vibe words (e.g. "dark", "sleep", "pump up", "rainy")
 - targetGenres: 1–4 clusters that fit the query
-- artist: string if user explicitly named an artist, otherwise null
-- label: concise name for the resulting playlist`;
+- artist: string only if the user explicitly named an artist, otherwise null
+- language: one of the allowed values if the query implies a language/region, otherwise null
+- label: 2–4 word playlist name`;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// LLM integrations
-// ─────────────────────────────────────────────────────────────────────────────
+// ── LLM parsers ──────────────────────────────────────────────────────────────
 
 async function parseWithGemini(query) {
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
     {
-      method: 'POST',
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+      body:    JSON.stringify({
         systemInstruction: { parts: [{ text: LLM_SYSTEM_PROMPT }] },
-        contents: [{ role: 'user', parts: [{ text: query }] }],
-        generationConfig: { maxOutputTokens: 300, temperature: 0.2 },
+        contents:          [{ role: 'user', parts: [{ text: query }] }],
+        generationConfig:  { maxOutputTokens: 300, temperature: 0.2 },
       }),
     }
   );
@@ -231,18 +254,18 @@ async function parseWithGemini(query) {
 
 async function parseWithGroq(query) {
   const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
+    method:  'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+      Authorization:  `Bearer ${process.env.GROQ_API_KEY}`,
     },
     body: JSON.stringify({
-      model: 'llama-3.3-70b-versatile',
+      model:       'llama-3.3-70b-versatile',
       temperature: 0.2,
-      max_tokens: 300,
+      max_tokens:  300,
       messages: [
         { role: 'system', content: LLM_SYSTEM_PROMPT },
-        { role: 'user', content: query },
+        { role: 'user',   content: query },
       ],
     }),
   });
@@ -269,13 +292,13 @@ async function parseWithLLM(query) {
       parsed = await parseWithGroq(query);
     } catch (groqErr) {
       console.warn('[intent] Groq also unavailable:', groqErr.message);
-      // Both LLMs failed — return a safe generic intent
       return {
-        keywords: expandKeywords([query]),
+        keywords:     expandKeywords([query]),
         targetGenres: [],
-        artist: null,
-        label: 'Filtered Playlist',
-        source: 'fallback',
+        artist:       null,
+        language:     null,
+        label:        'Filtered Playlist',
+        source:       'fallback',
       };
     }
   }
@@ -283,37 +306,25 @@ async function parseWithLLM(query) {
   return {
     keywords:     expandKeywords(parsed.keywords || [query]),
     targetGenres: parsed.targetGenres || [],
-    artist:       parsed.artist || null,
-    label:        parsed.label || 'Filtered Playlist',
+    artist:       parsed.artist       || null,
+    language:     parsed.language     || null,
+    label:        parsed.label        || 'Filtered Playlist',
     source:       'llm',
   };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Public API
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Public API ────────────────────────────────────────────────────────────────
 
-/**
- * Parse a natural language query into structured intent.
- *
- * @param {string} query - user's natural language input
- * @returns {Promise<{
- *   keywords: string[],
- *   targetGenres: string[],
- *   artist: string|null,
- *   label: string,
- *   source: string
- * }>}
- */
 async function parseIntent(query) {
   const ruleMatch = matchRules(query);
 
   if (ruleMatch) {
-    console.log(`[intent] rule match → "${ruleMatch.label}"`);
+    console.log(`[intent] rule match → "${ruleMatch.label}" lang=${ruleMatch.language || 'none'}`);
     return {
       keywords:     expandKeywords(ruleMatch.keywords),
       targetGenres: ruleMatch.genres,
       artist:       null,
+      language:     ruleMatch.language || null,
       label:        ruleMatch.label,
       source:       'rules',
     };

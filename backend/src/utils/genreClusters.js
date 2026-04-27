@@ -1,15 +1,8 @@
 /**
  * genreClusters.js
  * Maps raw Spotify genre strings → high-level cluster names.
- *
- * Spotify returns genres like: "album rock", "indie folk", "trap soul", etc.
- * This maps them into a small set of user-facing clusters so the intent
- * parser output can match against tracks generically.
- *
- * A single raw genre can belong to multiple clusters.
  */
 
-// cluster name → array of genre substrings that map to it
 const CLUSTER_MAP = {
   'pop': [
     'pop', 'dance pop', 'electropop', 'synth pop', 'indie pop', 'teen pop',
@@ -75,15 +68,26 @@ const CLUSTER_MAP = {
     'reggae', 'ska', 'rocksteady', 'dub', 'dancehall', 'roots reggae',
   ],
   'gospel': [
-    'gospel', 'christian', 'worship', 'contemporary christian',
-    'ccm', 'religious',
+    'gospel', 'christian', 'worship', 'contemporary christian', 'ccm', 'religious',
+  ],
+
+  // ── Regional / language clusters ──────────────────────────────────────────
+  'bollywood': [
+    'bollywood', 'filmi', 'hindi pop', 'hindi film', 'desi pop',
+    'indian pop', 'tollywood', 'kollywood', 'mollywood',
+    'carnatic', 'hindustani', 'indian classical', 'classical indian',
+    'bhajan', 'ghazal', 'devotional', 'sufi', 'qawwali', 'punjabi pop',
+  ],
+  'punjabi': [
+    'punjabi', 'bhangra', 'desi hip hop', 'punjabi folk',
+  ],
+  'kpop': [
+    'k-pop', 'korean pop', 'korean r&b', 'korean indie', 'k-indie',
+    'k-rock', 'j-pop', 'j-rock', 'city pop', 'japanese pop',
   ],
 };
 
-// Inverted index: each raw genre substring → array of cluster names
-// Built once at startup for O(1) lookups
 const _invertedIndex = new Map();
-
 for (const [cluster, substrings] of Object.entries(CLUSTER_MAP)) {
   for (const sub of substrings) {
     if (!_invertedIndex.has(sub)) _invertedIndex.set(sub, []);
@@ -91,49 +95,21 @@ for (const [cluster, substrings] of Object.entries(CLUSTER_MAP)) {
   }
 }
 
-/**
- * Map a single Spotify genre string to an array of cluster names.
- * A genre can match multiple clusters (e.g. "trap" → ['hip-hop']).
- * Returns an empty array if no cluster matches.
- *
- * @param {string} rawGenre
- * @returns {string[]} cluster names
- */
 function genreToClusters(rawGenre) {
   const g = rawGenre.toLowerCase().trim();
   const matched = new Set();
-
   for (const [sub, clusters] of _invertedIndex.entries()) {
-    if (g.includes(sub)) {
-      clusters.forEach(c => matched.add(c));
-    }
+    if (g.includes(sub)) clusters.forEach(c => matched.add(c));
   }
-
   return [...matched];
 }
 
-/**
- * Map an array of Spotify genres to a deduplicated array of clusters.
- * @param {string[]} rawGenres
- * @returns {string[]}
- */
 function genresToClusters(rawGenres) {
-  const all = rawGenres.flatMap(genreToClusters);
-  return [...new Set(all)];
+  return [...new Set(rawGenres.flatMap(genreToClusters))];
 }
 
-/**
- * Compute a genre match score between a track's clusters and
- * the intent's target genres.
- *
- * @param {string[]} trackClusters   clusters a track belongs to
- * @param {string[]} targetClusters  clusters the user wants
- * @returns {number} 0–1
- */
 function genreMatchScore(trackClusters, targetClusters) {
-  if (!targetClusters || targetClusters.length === 0) return 0;
-  if (!trackClusters || trackClusters.length === 0) return 0;
-
+  if (!targetClusters?.length || !trackClusters?.length) return 0;
   const trackSet = new Set(trackClusters);
   const matches = targetClusters.filter(c => trackSet.has(c)).length;
   return matches / targetClusters.length;
