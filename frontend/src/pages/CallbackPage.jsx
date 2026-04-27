@@ -23,7 +23,7 @@ const CallbackPage = () => {
 
     const exchangeCode = async () => {
       try {
-        const response = await axios.post('http://localhost:5001/auth/callback', { code });
+        const response = await axios.post('http://127.0.0.1:5001/auth/callback', { code });
         const { access_token, refresh_token } = response.data;
         
         if (access_token) {
