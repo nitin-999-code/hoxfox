@@ -4,8 +4,8 @@
  *
  * Allowed endpoints (per spec — audio-features is EXCLUDED, it causes 403):
  *   GET /me/playlists
- *   GET /playlists/:id  (+ pagination via /playlists/:id/tracks)
- *   GET /artists?ids=…  (batch up to 50 per request)
+ *   GET /playlists/:id/tracks  (paginated — NOT the full playlist object)
+ *   GET /artists?ids=…         (batch up to 50 per request)
  *   POST /users/:uid/playlists
  *   POST /playlists/:id/tracks
  *
@@ -76,13 +76,26 @@ async function getPlaylistTracks(playlistId, accessToken, refreshToken) {
     async token => {
       console.log('[spotify] Fetching tracks for playlist:', playlistId);
 
-      // Use the standard playlist endpoint to get tracks
-      const response = await axios.get(`${BASE_URL}/playlists/${playlistId}`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      const data = response.data;
-      
-      const pagingObj = data.tracks || data.items;
+      let pagingObj;
+
+      try {
+        console.log('[spotify] Trying GET /playlists/{id}/items');
+        const tracksRes = await axios.get(`${BASE_URL}/playlists/${playlistId}/items`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        pagingObj = tracksRes.data;
+      } catch (err) {
+        if (err.response?.status === 403) {
+          console.warn('[spotify] /items endpoint returned 403. Falling back to /playlists/{id}');
+          const fallbackRes = await axios.get(`${BASE_URL}/playlists/${playlistId}`, {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+          pagingObj = fallbackRes.data.tracks || fallbackRes.data.items;
+        } else {
+          throw err;
+        }
+      }
+
       if (!pagingObj || typeof pagingObj !== 'object') return [];
 
       let allRawItems = Array.isArray(pagingObj.items) ? [...pagingObj.items] : [];
@@ -102,13 +115,18 @@ async function getPlaylistTracks(playlistId, accessToken, refreshToken) {
         }
       }
 
-      // Normalise: handle both { track: {...} } and bare track objects
-      const tracks = allRawItems.map(entry => {
-        if (entry && entry.track) return entry;
-        if (entry && entry.item) return { track: entry.item };
-        return { track: entry };
-      });
+      console.log(`[spotify] Fetched ${allRawItems.length} raw items from playlist`);
 
+      const tracks = allRawItems
+        .filter(entry => entry !== null && entry !== undefined)
+        .map(entry => {
+          if (entry && entry.track) return entry;
+          if (entry && entry.item) return { track: entry.item };
+          return { track: entry };
+        })
+        .filter(entry => entry.track !== null);
+
+      console.log(`[spotify] ${tracks.length} valid (non-null) tracks after filtering`);
       return tracks;
     },
     accessToken,
