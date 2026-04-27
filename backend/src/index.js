@@ -7,6 +7,7 @@ const errorHandler = require('./middleware/errorHandler');
 const authRoutes = require('./routes/auth');
 const playlistRoutes = require('./routes/playlist');
 const genreRoutes = require('./routes/genres');
+const filterRoutes = require('./routes/filter');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -100,6 +101,7 @@ app.get('/debug/spotify-test', async (req, res) => {
 app.use('/auth', authRoutes);
 app.use('/playlists', playlistRoutes);
 app.use('/api/genres', genreRoutes);
+app.use('/api/filter', filterRoutes);
 
 // Error handling middleware should be last
 app.use(errorHandler);
