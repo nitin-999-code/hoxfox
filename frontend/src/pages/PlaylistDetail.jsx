@@ -156,24 +156,30 @@ const PlaylistDetail = () => {
                 const track = item.track || item;
                 if (!track || !track.name) return null;
                 const durationMs = track.duration_ms || track.durationMs;
+                const albumUrl = track.album?.images?.[0]?.url || track.album?.imageUrl;
                 return (
-                  <li key={track.id || index} className="flex items-center space-x-4 p-3 hover:bg-gray-800 rounded-md transition cursor-default">
-                    {track.album?.images?.[0] ? (
-                      <img src={track.album.images[0].url} className="w-12 h-12 rounded object-cover shadow-sm" alt={track.name} />
+                  <li key={track.id || index} className="flex items-start space-x-4 p-3 hover:bg-gray-800 rounded-md transition cursor-default">
+                    {albumUrl ? (
+                      <img src={albumUrl} className="w-12 h-12 rounded object-cover shadow-sm shrink-0" alt={track.name} />
                     ) : (
-                      <div className="w-12 h-12 bg-gray-700 rounded flex items-center justify-center">🎵</div>
+                      <div className="w-12 h-12 bg-gray-700 rounded flex items-center justify-center shrink-0">🎵</div>
                     )}
                     <div className="flex-1 min-w-0">
                       <p className="font-semibold text-white truncate">{track.name}</p>
                       <p className="text-sm text-gray-400 truncate">
                         {track.artists?.map(a => a.name || a).join(', ') || 'Unknown Artist'}
                       </p>
+                      {isFiltered && item.matchReasons && item.matchReasons.length > 0 && (
+                        <p className="text-xs text-green-400/90 mt-1 italic line-clamp-2">
+                          💡 {Array.isArray(item.matchReasons) ? item.matchReasons.join('. ') : item.matchReasons}
+                        </p>
+                      )}
                     </div>
-                    <div className="flex items-center gap-3">
+                    <div className="flex items-center gap-3 self-center">
                       {/* Score badge only shown when filtered — NEW */}
                       {isFiltered && item.score !== undefined && (
-                        <span className="text-xs px-2 py-1 rounded-full bg-green-900 text-green-300 font-medium">
-                          {item.score}%
+                        <span className="text-xs px-2 py-1 rounded-full bg-green-950 text-green-300 font-semibold border border-green-800/30">
+                          {item.score}% match
                         </span>
                       )}
                       {durationMs && (

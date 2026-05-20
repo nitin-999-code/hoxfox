@@ -165,8 +165,11 @@ exports.filterPlaylist = async (req, res) => {
     const intent = await parseIntent(query);
 
     // ── Step 9: Adaptive pre-filter ─────────────────────────────────────────
+    // Commented out all rule-based initial filtering logic
+    /*
     const preFiltered = filterTracks(enriched, intent, { topN, maxPerArtist });
     console.log(`[filter] adaptive pre-filter: ${unique.length} → ${preFiltered.tracks.length} tracks`);
+    */
 
     // ── Step 10: Call CrewAI ────────────────────────────────────────────────
     let finalTracks = [];
@@ -174,16 +177,17 @@ exports.filterPlaylist = async (req, res) => {
     let crewAIFailed = false;
 
     try {
-      const crewInputTracks = preFiltered.tracks.map(s => ({
-        id: s.track.id,
-        name: s.track.name,
-        artists: s.track.artists,
-        genres: s.track.genres,
-        clusters: s.track.clusters,
-        moodTags: s.track.moodTags,
-        popularity: s.track.popularity,
-        score: s.score,
-        matchReasons: s.matchReasons
+      // Map all songs in the playlist to go to the AI
+      const crewInputTracks = enriched.map(s => ({
+        id: s.id,
+        name: s.name,
+        artists: s.artists,
+        genres: s.genres,
+        clusters: s.clusters,
+        moodTags: s.moodTags,
+        popularity: s.popularity,
+        score: 0,
+        matchReasons: []
       }));
 
       crewAIResult = await crewAIService.getCrewAIRecommendations({
@@ -193,23 +197,33 @@ exports.filterPlaylist = async (req, res) => {
         generateReport
       });
 
-      // Map CrewAI recommendations back to enriched track data or use as is
-      // Note: CrewAI returns a list of { title, artist, album, year, spotify_id, uri ... }
+      // Map CrewAI recommendations back to enriched track data
       if (crewAIResult.playlist && Array.isArray(crewAIResult.playlist)) {
-        finalTracks = crewAIResult.playlist;
+        finalTracks = crewAIResult.playlist.map(item => {
+          const origTrack = enriched.find(t => t.id === item.id);
+          if (!origTrack) return null;
+          return {
+            ...origTrack,
+            score: item.score,
+            matchReasons: item.matchReasons
+          };
+        }).filter(Boolean);
       } else {
         throw new Error('CrewAI returned an empty or invalid playlist');
       }
     } catch (err) {
-      console.error('[filter] CrewAI failed, falling back to pre-filter:', err.message);
+      console.error('[filter] CrewAI failed:', err.message);
       crewAIFailed = true;
-      // Fallback to pre-filtered tracks formatted as ScoredTrack objects
+      // Commented out rule-based fallback
+      /*
       finalTracks = preFiltered.tracks.map(s => ({
         ...s.track,
         score: Math.round(s.score),
         matchReasons: s.matchReasons,
         scoreBreakdown: s.components
       }));
+      */
+      throw err;
     }
 
     // ── Step 11 (optional): Create new Spotify playlist ─────────────────────
@@ -229,7 +243,7 @@ exports.filterPlaylist = async (req, res) => {
     // ── Step 12: Respond ────────────────────────────────────────────────────
     return res.json({
       label: intent.label,
-      intentSource: intent.source,
+      intentSource: 'AI',
       intent: {
         keywords: intent.keywords,
         targetGenres: intent.targetGenres,
@@ -237,9 +251,9 @@ exports.filterPlaylist = async (req, res) => {
         artist: intent.artist,
       },
       totalConsidered: rawTracks.length,
-      preFilteredCount: preFiltered.tracks.length,
+      preFilteredCount: enriched.length,
       totalReturned: finalTracks.length,
-      relaxed: preFiltered.relaxed,
+      relaxed: false,
       crewAIFailed,
       report: crewAIResult?.report || null,
       finalScore: crewAIResult?.final_score || null,

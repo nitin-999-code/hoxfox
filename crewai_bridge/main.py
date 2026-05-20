@@ -1,10 +1,10 @@
 import os
 import json
+import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
-from crew_runner import EnterpriseAiMusicRecommendationSystemCrew
 
 load_dotenv()
 
@@ -42,77 +42,157 @@ async def health():
 @app.post("/recommend", response_model=RecommendResponse)
 async def recommend(request: RecommendRequest):
     try:
-        # 1. Select seed tracks (top 5 by score)
-        sorted_tracks = sorted(request.playlist_tracks, key=lambda x: x.score, reverse=True)
-        seed_tracks = sorted_tracks[:5]
-        seed_ids = [t.id for t in seed_tracks]
-
-        # 2. Build context (top 20 tracks)
-        context_tracks = []
-        for t in sorted_tracks[:20]:
-            context_tracks.append({
+        # 1. Build list of tracks to send to the AI
+        tracks_data = []
+        for t in request.playlist_tracks:
+            tracks_data.append({
                 "id": t.id,
                 "name": t.name,
                 "artists": t.artists,
                 "genres": t.genres,
                 "clusters": t.clusters,
-                "moodTags": t.moodTags
+                "moodTags": t.moodTags,
+                "popularity": t.popularity
             })
 
-        # 3. Build crew inputs
-        inputs = {
-            "music_request": request.music_request,
-            "playlist_context": json.dumps(context_tracks),
-            "seed_track_ids": ",".join(seed_ids),
-            "spotify_access_token": request.spotify_access_token,
-            "generate_report": str(request.generate_report)
-        }
-
-        # 4. Instantiate and kickoff crew
-        crew_instance = EnterpriseAiMusicRecommendationSystemCrew().crew()
-        result = crew_instance.kickoff(inputs=inputs)
-
-        # 5. Parse result
-        raw_output = result.raw
+        # 2. Call Gemini API directly using requests
+        api_key = os.getenv("GOOGLE_API_KEY")
+        groq_api_key = os.getenv("GROQ_API_KEY")
+        
         playlist = []
-        report = None
+        text_content = ""
+        success = False
+        
+        prompt = f"""You are an expert music curator AI. 
+The user wants to filter their playlist to match this request: "{request.music_request}"
 
-        # The final task output is a markdown report — the playlist lives in earlier tasks.
-        # Search task outputs in reverse for the first one containing a clean_playlist or songs array.
-        try:
-            tasks_output = result.tasks_output if hasattr(result, 'tasks_output') else []
+Evaluate every song in the following playlist. Determine which songs match the user's intent, vibe, energy, mood, genre, context, or style requested.
+For each matching song, calculate an alignment score (0 to 100) representing how well it fits. 
+Be realistic and differentiate the scores (do not return 100 for all matching tracks; use the full range).
+Also provide a short explanation (match reason) for each selected song.
+
+Playlist Tracks:
+{json.dumps(tracks_data, indent=2)}
+
+Output a JSON object containing the filtered list of matching tracks. Do NOT return any markdown code blocks or explanations outside of the JSON.
+
+Expected Output Format:
+{{
+  "playlist": [
+    {{
+      "id": "song_id",
+      "score": 85,
+      "matchReasons": ["Fits the acoustic and calm mood requested"]
+    }}
+  ]
+}}"""
+
+        # Try Gemini 2.0 Flash first
+        if api_key:
+            try:
+                headers = {"Content-Type": "application/json"}
+                payload = {
+                    "contents": [{
+                        "parts": [{
+                            "text": prompt
+                        }]
+                    }],
+                    "generationConfig": {
+                        "responseMimeType": "application/json"
+                    }
+                }
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+                resp = requests.post(url, json=payload, headers=headers)
+                if resp.status_code == 200:
+                    resp_json = resp.json()
+                    text_content = resp_json['candidates'][0]['content']['parts'][0]['text'].strip()
+                    success = True
+                else:
+                    print(f"Gemini 2.0 Flash failed: status {resp.status_code}, error: {resp.text}")
+            except Exception as e:
+                print(f"Gemini 2.0 Flash exception: {e}")
+                
+        # Try Gemini 1.5 Flash fallback
+        if not success and api_key:
+            try:
+                headers = {"Content-Type": "application/json"}
+                payload = {
+                    "contents": [{
+                        "parts": [{
+                            "text": prompt
+                        }]
+                    }],
+                    "generationConfig": {
+                        "responseMimeType": "application/json"
+                    }
+                }
+                url_fallback = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+                resp = requests.post(url_fallback, json=payload, headers=headers)
+                if resp.status_code == 200:
+                    resp_json = resp.json()
+                    text_content = resp_json['candidates'][0]['content']['parts'][0]['text'].strip()
+                    success = True
+                else:
+                    print(f"Gemini 1.5 Flash failed: status {resp.status_code}, error: {resp.text}")
+            except Exception as e:
+                print(f"Gemini 1.5 Flash exception: {e}")
+
+        # Try Groq Llama 3.3 fallback
+        if not success and groq_api_key:
+            try:
+                print("Falling back to Groq Llama-3.3-70b...")
+                groq_url = "https://api.groq.com/openai/v1/chat/completions"
+                groq_headers = {
+                    "Authorization": f"Bearer {groq_api_key}",
+                    "Content-Type": "application/json"
+                }
+                groq_payload = {
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [
+                        {"role": "system", "content": "You are a professional music recommendation assistant. You return only raw JSON as requested."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "response_format": {"type": "json_object"}
+                }
+                resp = requests.post(groq_url, json=groq_payload, headers=groq_headers)
+                if resp.status_code == 200:
+                    resp_json = resp.json()
+                    text_content = resp_json['choices'][0]['message']['content'].strip()
+                    success = True
+                else:
+                    print(f"Groq Llama-3.3 failed: status {resp.status_code}, error: {resp.text}")
+            except Exception as e:
+                print(f"Groq Llama-3.3 exception: {e}")
+
+        if not success:
+            raise Exception("All AI APIs failed (Gemini and Groq). Please check quota/keys.")
+
+        parsed_result = json.loads(text_content)
+        playlist = parsed_result.get("playlist", [])
+
+        # 3. Sanitize and format outputs
+        sanitized_playlist = []
+        for track_item in playlist:
+            track_id = track_item.get("id")
+            score = track_item.get("score", 0)
+            try:
+                score = int(float(score))
+            except:
+                score = 0
             
-            for task_output in reversed(tasks_output):
-                text = task_output.raw if hasattr(task_output, 'raw') else str(task_output)
-                # Look for JSON with clean_playlist or songs key
-                try:
-                    # Strip markdown code fences if present
-                    clean = text.replace('```json', '').replace('```', '').strip()
-                    parsed = json.loads(clean)
-                    if isinstance(parsed, dict):
-                        if 'clean_playlist' in parsed and isinstance(parsed['clean_playlist'], list):
-                            playlist = parsed['clean_playlist']
-                            break
-                        elif 'songs' in parsed and isinstance(parsed['songs'], list):
-                            playlist = parsed['songs']
-                            break
-                        elif 'playlist' in parsed and isinstance(parsed['playlist'], list):
-                            playlist = parsed['playlist']
-                            break
-                    elif isinstance(parsed, list) and len(parsed) > 0:
-                        playlist = parsed
-                        break
-                except:
-                    continue
-        except Exception as parse_err:
-            print(f"[main] result parsing warning: {parse_err}")
-
-        # The final task (generate_final_report) raw output is the report
-        report = raw_output if request.generate_report else None
+            reasons = track_item.get("matchReasons", [])
+            if isinstance(reasons, str):
+                reasons = [reasons]
+            
+            if track_id:
+                sanitized_playlist.append({
+                    "id": track_id,
+                    "score": score,
+                    "matchReasons": reasons
+                })
 
         return RecommendResponse(
-            playlist=playlist,
-            report=report if request.generate_report else None,
+            playlist=sanitized_playlist,
             status="success"
         )
 
