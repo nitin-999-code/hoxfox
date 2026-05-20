@@ -1,0 +1,306 @@
+---
+parse_music_request_intent:
+  description: 'Convert user query: "{music_request}" into structured music intent.
+    Extract mood, energy, tempo, context, and genre hints. Detect layered emotions
+    (e.g., "sad but peaceful"). Do NOT oversimplify.'
+  expected_output: |-
+    JSON format: {
+      "mood": [],
+      "energy_level": "",
+      "tempo": "",
+      "context": "",
+      "activity": "",
+      "genre_hints": []
+    }
+  agent: natural_language_interpreter
+initialize_system_config:
+  description: Load current system configuration at the start of the automation run.
+    Check for existing learned parameters from previous runs. If system_config exists,
+    provide it to downstream agents. If no config exists, use default parameters and
+    note this is a first run.
+  expected_output: |-
+    JSON format:
+    {
+      "config_status": "loaded | default",
+      "current_config": {
+        "energy_range": [min, max],
+        "valence_range": [min, max],
+        "tempo_range": [min, max],
+        "diversity_weight": 0.25,
+        "penalty_repeat_artist": -15,
+        "penalty_out_of_range_tempo": -10,
+        "penalty_emotional_mismatch": -20
+      },
+      "run_type": "learning_enabled | first_run"
+    }
+  agent: config_manager
+analyze_emotional_context:
+  description: Analyze emotional depth and nuance from the structured music intent.
+    Identify dominant + secondary emotion, detect intensity (low/medium/high), and
+    differentiate similar emotions (sad vs nostalgic vs calm). Provide precise emotional
+    profiling that captures the full psychological context.
+  expected_output: |-
+    JSON format: {
+      "dominant_emotion": "",
+      "secondary_emotion": "",
+      "intensity": "",
+      "emotional_depth": ""
+    }
+  agent: emotional_intelligence_analyst
+  context:
+  - parse_music_request_intent
+map_audio_features:
+  description: 'Convert emotional + contextual input into audio feature ranges. Map
+    to realistic Spotify audio features: energy (0–1), valence (0–1), tempo (BPM).
+    Avoid random values and provide scientific justification for all mappings based
+    on music psychology principles.'
+  expected_output: |-
+    JSON format: {
+      "energy_range": [min, max],
+      "valence_range": [min, max],
+      "tempo_range": [min, max],
+      "acousticness": "",
+      "instrumentalness": "",
+      "justification": ""
+    }
+  agent: music_feature_translator
+  context:
+  - analyze_emotional_context
+  - initialize_system_config
+retrieve_real_songs:
+  description: 'Retrieve real songs using the Spotify Recommendation Tool. You MUST
+    call the Spotify Recommendation Tool with these exact values: seed_track_ids:
+    "{seed_track_ids}", spotify_access_token: "{spotify_access_token}". Get the
+    target_energy, target_valence, and target_tempo values from the map_audio_features
+    task output. Use limit 20. After getting results from Spotify, ensure all returned
+    songs are real and diverse across artists. Never generate fake tracks.'
+  expected_output: |-
+    JSON format:
+    {
+      "songs": [
+        {
+          "title": "",
+          "artist": "",
+          "album": "",
+          "year": "",
+          "energy": "",
+          "valence": "",
+          "tempo": ""
+        }
+      ]
+    }
+  agent: music_data_fetcher
+  context:
+  - map_audio_features
+score_song_match_quality:
+  description: 'Score each song based on match quality using weighted algorithm: mood_match
+    (35%) + energy_match (25%) + context_match (20%) + audio_feature_match (10%) +
+    diversity_bonus (10%). Apply penalties: -15 points for repeated artists, -10 for
+    out-of-range tempo, -20 for emotional mismatch. Provide clear reasoning for each
+    score.'
+  expected_output: |-
+    JSON format:
+    {
+      "ranked_songs": [
+        {
+          "title": "",
+          "artist": "",
+          "score": "",
+          "reason": ""
+        }
+      ]
+    }
+  agent: recommendation_engine
+  context:
+  - retrieve_real_songs
+  - analyze_emotional_context
+  - initialize_system_config
+create_coherent_playlist:
+  description: Create a coherent playlist with smooth emotional flow while avoiding
+    monotony. Strictly enforce maximum 1 song per artist - no exceptions. Focus on
+    seamless transitions and dynamic progression that maintains listener engagement.
+    Arrange songs to tell an emotional story while preventing repetitive patterns.
+  expected_output: |-
+    JSON format:
+    {
+      "playlist_name": "",
+      "songs": [],
+      "flow_description": ""
+    }
+  agent: music_curator
+  context:
+  - score_song_match_quality
+validate_playlist_quality:
+  description: 'Validate the final playlist before acceptance using strict validation
+    rules: 1) AUTHENTICITY CHECK - ensure all songs are real and recognizable, remove
+    fake songs 2) ARTIST DIVERSITY CHECK - no artist appears more than once, remove
+    lower scored duplicates 3) FEATURE CONSISTENCY CHECK - verify songs fall within
+    defined energy, tempo, valence ranges 4) SCORE VALIDATION - ensure scoring logic
+    applied correctly, detect unrealistic scores 5) OUTPUT QUALITY CHECK - no vague
+    explanations or generic phrases 6) FAILURE HANDLING - if more than 30% songs fail
+    validation, return "REGENERATE PLAYLIST" 7) CONSTRAINT HANDLING - if fewer than
+    5 valid songs remain after filtering, trigger re-fetch process with relaxed constraints'
+  expected_output: |-
+    JSON format:
+    {
+      "status": "approved | rejected | re-fetch",
+      "issues_found": [],
+      "clean_playlist": [],
+      "action_required": ""
+    }
+  agent: quality_control_specialist
+  context:
+  - create_coherent_playlist
+explain_song_selection:
+  description: Explain why songs were selected by referencing actual audio features
+    (tempo, energy, valence, acousticness, etc.). Avoid poetic language and focus
+    on technical, measurable criteria that led to each song's inclusion in the playlist.
+  expected_output: |-
+    JSON format:
+    {
+      "explanations": []
+    }
+  agent: explainability_expert
+  context:
+  - validate_playlist_quality
+generate_playlist_analytics:
+  description: Generate measurable insights from the final playlist data. Calculate
+    statistical metrics including average energy, tempo, valence, and diversity scores.
+    Analyze patterns and provide quantitative observations that reveal the quality
+    and characteristics of the music recommendations.
+  expected_output: |-
+    JSON format:
+    {
+      "average_energy": "",
+      "average_tempo": "",
+      "average_valence": "",
+      "diversity_score": "",
+      "observations": []
+    }
+  agent: data_analyst
+  context:
+  - validate_playlist_quality
+calculate_playlist_score:
+  description: 'Calculate final playlist score using the formula: final_score = relevance
+    * 0.5 + emotional_consistency * 0.3 + diversity * 0.2. Evaluate each component
+    objectively and identify specific strengths and weaknesses based on measurable
+    criteria.'
+  expected_output: |-
+    JSON format:
+    {
+      "final_score": "",
+      "strengths": [],
+      "weaknesses": [],
+      "confidence_score": "0-100",
+      "confidence_level": "High | Medium | Low",
+      "confidence_factors": {
+        "data_completeness": "",
+        "feature_alignment": "",
+        "diversity_quality": ""
+      }
+    }
+  agent: evaluation_engine
+  context:
+  - validate_playlist_quality
+  - explain_song_selection
+analyze_performance_and_learn:
+  description: 'Analyze the final playlist performance to improve future recommendations.
+    INPUT: Final playlist, matching metrics, validation results, final score. INSTRUCTIONS:
+    1) IDENTIFY PATTERNS - detect if playlist had low diversity, over-restrictive
+    filtering, weak emotional consistency 2) PARAMETER ADJUSTMENT - suggest improvements
+    like adjust energy/tempo ranges, reduce penalty strictness, increase diversity
+    weight 3) LEARNING OUTPUT - provide updated system tuning parameters 4) MEMORY
+    - store insights for future runs'
+  expected_output: "JSON format:\n{\n  \"issues_detected\": [],\n  \"parameter_updates\":
+    {\n    \"energy_range_adjustment\": \"\",\n    \"diversity_weight\": \"\",\n    \"penalty_adjustments\":
+    \"\"\n  },\n  \"learning_summary\": \"\",\n  \"proposed_config\": {\n    \"energy_range\":
+    [min, max],\n    \"valence_range\": [min, max], \n    \"tempo_range\": [min, max],\n
+    \   \"diversity_weight\": 0.25,\n    \"penalty_repeat_artist\": -10,\n    \"penalty_out_of_range_tempo\":
+    -10,\n    \"penalty_emotional_mismatch\": -20\n  },\n  \"learning_note\": \"SEND
+    TO STABILITY CONTROLLER FOR VALIDATION\"\n}"
+  agent: feedback_learning_agent
+  context:
+  - validate_playlist_quality
+  - calculate_playlist_score
+  - generate_playlist_analytics
+validate_config_stability:
+  description: "Validate and regulate parameter updates from the Feedback Learning
+    Agent before saving them. Apply strict safety rules: \n\n**RANGE BOUNDING:**\n-
+    energy_range must stay within [0.1, 0.7]  \n- valence_range must stay within [0.1,
+    0.8]\n- tempo_range must stay within [60, 140]\n\n**CHANGE LIMITING:**\n- No parameter
+    should change more than ±20% per run\n\n**DIVERSITY WEIGHT CONTROL:**\n- Must
+    remain between 0.1 and 0.4\n\n**PENALTY LIMITS:**\n- penalty_repeat_artist: [-5
+    to -25]\n- penalty_emotional_mismatch: [-10 to -30]\n\n**DRIFT DETECTION:**\n-
+    If parameters become too broad → reset toward default midpoint\n\n**CRITICAL**:
+    Return corrected_config only - do not store unsafe parameters."
+  expected_output: "JSON format:\n{\n  \"corrected_config\": {\n    \"energy_range\":
+    [min, max],\n    \"valence_range\": [min, max], \n    \"tempo_range\": [min, max],\n
+    \   \"diversity_weight\": 0.xx,\n    \"penalty_repeat_artist\": -xx,\n    \"penalty_emotional_mismatch\":
+    -xx\n  },\n  \"corrections_applied\": [],\n  \"safety_status\": \"safe | drift_corrected
+    | bounds_enforced\"\n}"
+  agent: stability_controller
+  context:
+  - analyze_performance_and_learn
+log_parameter_changes:
+  description: "Track and record all parameter changes from the Stability Controller
+    before config storage. INPUT: Previous config, new corrected config, corrections
+    applied. INSTRUCTIONS:\n\n**1. LOG CHANGES**\n- Record what changed and by how
+    much\n- Document percentage changes for each parameter\n- Track timestamp and
+    run identifier\n\n**2. TRACK HISTORY** \n- Maintain last 5 runs of parameter evolution\n-
+    Store change patterns and trends\n- Identify recurring adjustment patterns\n\n**3.
+    DETECT PATTERNS**\n- Analyze if system is stable, improving, or oscillating\n-
+    Identify repeated adjustments in same parameters\n- Flag potential issues like
+    parameter drift or instability\n\n**4. RISK ASSESSMENT**\n- Evaluate change velocity
+    and direction\n- Detect dangerous oscillation patterns\n- Flag high-risk parameter
+    movements\n\n**CRITICAL**: Provide complete audit trail for system transparency
+    and debugging."
+  expected_output: "JSON format:\n{\n  \"change_log\": [\n    {\n      \"parameter\":
+    \"\",\n      \"old_value\": \"\",\n      \"new_value\": \"\", \n      \"change_percent\":
+    \"\",\n      \"reason\": \"\"\n    }\n  ],\n  \"trend\": \"stable | improving
+    | oscillating | degrading\",\n  \"risk_flag\": \"low | medium | high\",\n  \"pattern_analysis\":
+    \"\",\n  \"run_history\": [],\n  \"audit_summary\": \"\"\n}"
+  agent: audit_logger
+  context:
+  - validate_config_stability
+store_updated_config:
+  description: Store the **stability-validated** system configuration for use in future
+    automation runs. Use ONLY the corrected_config from the Stability Controller -
+    never store unvalidated parameters. Save the validated parameters to persistent
+    memory/storage so they can be retrieved in the next run. Ensure configuration
+    continuity and system safety across runs.
+  expected_output: |-
+    JSON format:
+    {
+      "storage_status": "success | failed",
+      "config_stored": {},
+      "next_run_ready": true,
+      "storage_location": "system_memory"
+    }
+  agent: config_manager
+  context:
+  - log_parameter_changes
+generate_final_report:
+  description: 'Convert all system outputs into a clean, analytical markdown report
+    following the exact 8-section format. STRICT INSTRUCTIONS: NO JSON in final output,
+    use structured markdown, be analytical not poetic.'
+  expected_output: "# AI Music Recommendation Report\n\n## 1. User Intent Summary\n[Analysis
+    of original request]\n\n## 2. Emotional Analysis  \n[Emotional profiling results]\n\n##
+    3. Audio Feature Mapping\n[Technical feature translation]\n\n## 4. Decision Trace\n**Step
+    1:** Intent → [parsed intent]\n**Step 2:** Feature Mapping → [energy/valence/tempo
+    ranges]\n**Step 3:** Filtering → [X songs → Y songs]\n**Step 4:** Scoring → [top
+    Z selected]\n**Step 5:** Validation → [final filtering results]\n**Final:** [N
+    songs delivered]\n\n## 5. Playlist\n[Final song list with metadata]\n\n## 6. Matching
+    Metrics & Confidence\n[Quantitative scoring, analytics, and confidence metrics]\n\n##
+    7. Explanation of Recommendations\n[Technical reasoning for selections]\n\n##
+    8. System Observations & Audit Trail\n[Analytical insights, patterns, and parameter
+    change history]\n\n## 9. Final Score & Verdict\n[Overall evaluation, confidence
+    assessment, and recommendations]"
+  agent: music_recommendation_report_generator
+  context:
+  - parse_music_request_intent
+  - validate_playlist_quality
+  - explain_song_selection
+  - calculate_playlist_score
+  - generate_playlist_analytics
+  - log_parameter_changes
+  - store_updated_config

@@ -236,6 +236,20 @@ async function addTracksToPlaylist(playlistId, uris, token, refreshToken) {
   );
 }
 
+// ── Get current user profile ──────────────────────────────────────────────
+async function getCurrentUser(token, refreshToken) {
+  return safeSpotifyRequest(
+    async accessToken => {
+      const response = await axios.get(`${BASE_URL}/me`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      return response.data;
+    },
+    token,
+    refreshToken
+  );
+}
+
 module.exports = {
   safeSpotifyRequest,
   getUserPlaylists,
@@ -243,4 +257,5 @@ module.exports = {
   getArtistGenresBatched,
   createPlaylist,
   addTracksToPlaylist,
+  getCurrentUser,
 };

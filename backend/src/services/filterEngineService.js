@@ -1,315 +1,220 @@
 /**
  * filterEngineService.js
- * Core scoring, ranking, and selection pipeline.
- *
- * Scoring weights (no artist in query):
- *   genre     45 pts  — F1-blend (recall-weighted) against target clusters
- *   mood      25 pts  — Last.fm tag overlap with query keywords
- *   keyword   20 pts  — track/artist name match against expanded keywords
- *   popularity 5 pts  — pure tiebreaker
- *   language  ±20 pts — bonus if language matches, soft penalty if it doesn't
- *   ───────────────────
- *   base max  95 pts  (+ up to 20 language bonus = 115, capped at 100)
- *
- * Scoring weights (with artist in query):
- *   artist    40 pts
- *   genre     25 pts
- *   mood      20 pts
- *   keyword   10 pts
- *   popularity 5 pts
- *
- * Key decisions:
- *   - NO normalizeScores() — scores are absolute, threshold has real meaning
- *   - Genre uses recall-weighted F1 so long target lists are not penalised
- *   - Mood tags need ≥1 keyword overlap (Last.fm tags enrich when available)
- *   - Keyword needs ≥2 matches for large keyword sets (prevents 1-word noise)
- *   - Language is a ±20 bonus/penalty (soft, not a hard exclude)
- *   - Fallback only triggers if <5 results, not just any miss
+ * Adaptive Pre-Filter Scoring Engine for Hoxfox.
+ * Scores and trims tracks before they are passed to the CrewAI pipeline.
  */
 
-const WEIGHTS = {
-  noArtist: { genre: 45, mood: 25, keyword: 20, popularity: 5 },
-  artist:   { artist: 40, genre: 25, mood: 20, keyword: 10, popularity: 5 },
+const SCORE_THRESHOLD = 18;
+const JITTER_RANGE = 1.5;
+
+const CLUSTER_ADJACENCY = {
+  chill: ['indie', 'classical', 'jazz'],
+  'hip-hop': ['rnb', 'pop', 'electronic'],
+  indie: ['chill', 'rock', 'pop'],
+  pop: ['rnb', 'indie', 'electronic'],
+  rock: ['indie', 'metal', 'blues'],
+  electronic: ['chill', 'hip-hop', 'pop'],
+  rnb: ['pop', 'hip-hop', 'jazz'],
+  bollywood: ['pop', 'rnb'],
+  kpop: ['pop', 'rnb'],
+  punjabi: ['bollywood', 'hip-hop'],
 };
 
-const DEFAULT_TOP_N    = 30;
-const MIN_RESULTS      = 5;
-const MAX_PER_ARTIST   = 3;
-const SCORE_THRESHOLD  = 22;   // absolute, out of 95 base
-const JITTER_RANGE     = 1.5;
-
-// Language → clusters that indicate the language
-const LANGUAGE_CLUSTER_MAP = {
-  hindi:   ['bollywood'],
-  punjabi: ['punjabi'],
-  korean:  ['kpop'],
-  spanish: ['latin'],
-};
-
-// Clusters/keywords that indicate a non-English language
 const NON_ENGLISH_MARKERS = {
   clusters: ['bollywood', 'punjabi', 'kpop', 'latin'],
   genreSubstrings: ['bollywood', 'filmi', 'hindi', 'k-pop', 'korean', 'latin', 'punjabi', 'bhangra'],
 };
 
-// ── Genre: F1-blend (70% recall + 30% precision + coverage bonus) ─────────────
-
-function improvedGenreScore(trackClusters, targetClusters) {
-  if (!targetClusters?.length || !trackClusters?.length) return 0;
-
-  const trackSet = new Set(trackClusters);
-  const matches  = targetClusters.filter(c => trackSet.has(c)).length;
-  if (matches === 0) return 0;
-
-  const recall    = matches / targetClusters.length;
-  const precision = matches / trackClusters.length;
-  const bonus     = recall >= 0.5 ? 0.15 : 0;
-
-  return Math.min(1, 0.7 * recall + 0.3 * precision + bonus);
-}
-
-// ── Mood tags: keyword overlap with Last.fm tags ──────────────────────────────
-
-function moodTagScore(track, keywords) {
-  if (!keywords?.length || !track.moodTags?.length) return 0;
-
-  const tagSet = track.moodTags.map(t => t.toLowerCase());
-  let matches  = 0;
-
-  for (const kw of keywords) {
-    if (tagSet.some(tag => tag.includes(kw) || kw.includes(tag))) matches++;
-  }
-
-  return Math.min(1, matches / Math.max(1, Math.ceil(keywords.length * 0.3)));
-}
-
-// ── Keyword: track/artist name match with tighter min threshold ───────────────
-
-function keywordScore(track, keywords) {
-  if (!keywords?.length) return 0;
-
-  const searchText = [track.nameLower, ...track.artistsLower].join(' ');
-  const matches    = keywords.filter(kw => searchText.includes(kw)).length;
-
-  // Require ≥2 hits when keyword list is large (prevents single coincidental match)
-  const minRequired = keywords.length > 5 ? 2 : 1;
-  if (matches < minRequired) return 0;
-
-  return Math.min(1, matches / Math.max(1, Math.ceil(keywords.length * 0.5)));
-}
-
-// ── Artist: exact or partial name match ──────────────────────────────────────
-
-function artistMatchScore(track, intentArtist) {
-  if (!intentArtist) return 0;
-  const ia = intentArtist.toLowerCase().trim();
-  return track.artistsLower.some(a => a.includes(ia) || ia.includes(a)) ? 1 : 0;
-}
-
-// ── Popularity: square-root curve so mid-tier tracks aren't buried ────────────
-
-function popularityScore(pop) {
-  return Math.sqrt((pop || 0) / 100);
-}
-
-// ── Language: ±20 bonus/penalty ──────────────────────────────────────────────
-
-function languageAdjustment(track, language) {
-  if (!language) return 0;
-
-  const allClusters = track.clusters || [];
-  const allGenres   = (track.genres || []).map(g => g.toLowerCase());
-
-  if (language === 'english') {
-    const isNonEnglish =
-      NON_ENGLISH_MARKERS.clusters.some(c => allClusters.includes(c)) ||
-      allGenres.some(g => NON_ENGLISH_MARKERS.genreSubstrings.some(ne => g.includes(ne)));
-    return isNonEnglish ? -15 : 5;
-  }
-
-  const targetClusters  = LANGUAGE_CLUSTER_MAP[language] || [];
-  const genreKeywords   = {
-    hindi:   ['bollywood', 'filmi', 'hindi', 'desi'],
-    punjabi: ['punjabi', 'bhangra'],
-    korean:  ['k-pop', 'korean'],
-    spanish: ['latin', 'reggaeton', 'spanish'],
-  }[language] || [];
-
-  const clusterMatch = targetClusters.some(c => allClusters.includes(c));
-  const genreMatch   = allGenres.some(g => genreKeywords.some(kw => g.includes(kw)));
-
-  return (clusterMatch || genreMatch) ? 20 : -10;
-}
-
-// ── Composite scorer ──────────────────────────────────────────────────────────
-
-function scoreTrack(track, intent) {
-  const { keywords = [], targetGenres = [], artist = null, language = null } = intent;
-
-  const gScore  = improvedGenreScore(track.clusters, targetGenres);
-  const mScore  = moodTagScore(track, keywords);
-  const kScore  = keywordScore(track, keywords);
-  const pScore  = popularityScore(track.popularity);
-  const langAdj = languageAdjustment(track, language);
-
-  let baseScore;
-
-  if (artist) {
-    const aScore = artistMatchScore(track, artist);
-    baseScore =
-      aScore * WEIGHTS.artist.artist +
-      gScore * WEIGHTS.artist.genre  +
-      mScore * WEIGHTS.artist.mood   +
-      kScore * WEIGHTS.artist.keyword +
-      pScore * WEIGHTS.artist.popularity;
-  } else {
-    // Redistribute artist weight: +20 to genre, +15 to keyword, +5 to popularity
-    baseScore =
-      gScore * (WEIGHTS.noArtist.genre      + 20) +
-      mScore *  WEIGHTS.noArtist.mood              +
-      kScore * (WEIGHTS.noArtist.keyword    + 15) +
-      pScore * (WEIGHTS.noArtist.popularity +  5);
-  }
-
-  const total = Math.max(0, Math.min(100, Math.round((baseScore + langAdj) * 100) / 100));
-
-  // ── Explainability ──────────────────────────────────────────────────────────
-  const matchReasons = [];
-
-  if (artist && artistMatchScore(track, artist) > 0)
-    matchReasons.push(`artist: ${artist}`);
-
-  if (gScore > 0.5)
-    matchReasons.push(`genre: ${track.clusters.join(', ')}`);
-  else if (gScore > 0)
-    matchReasons.push(`partial genre: ${track.clusters.join(', ')}`);
-
-  if (mScore > 0) {
-    const hitTags = (track.moodTags || []).filter(t =>
-      keywords.some(kw => t.toLowerCase().includes(kw) || kw.includes(t.toLowerCase()))
-    ).slice(0, 3);
-    if (hitTags.length) matchReasons.push(`mood tags: ${hitTags.join(', ')}`);
-  }
-
-  if (kScore > 0) {
-    const hitKws = keywords.filter(kw =>
-      [track.nameLower, ...track.artistsLower].join(' ').includes(kw)
-    ).slice(0, 3);
-    if (hitKws.length) matchReasons.push(`name match: ${hitKws.join(', ')}`);
-  }
-
-  if (langAdj > 0) matchReasons.push(`language match: ${language}`);
-  if (langAdj < 0) matchReasons.push(`language mismatch: ${language}`);
-
-  if (matchReasons.length === 0) matchReasons.push('popularity only');
-
-  return {
-    score: total,
-    components: {
-      genre:      Math.round(gScore * 100),
-      mood:       Math.round(mScore * 100),
-      keyword:    Math.round(kScore * 100),
-      popularity: Math.round(pScore * 100),
-      language:   langAdj,
-    },
-    matchReasons,
-  };
-}
-
-// ── Diversity: cap tracks per artist ─────────────────────────────────────────
-
-function applyDiversityFilter(scored, maxPerArtist) {
-  const counts = {};
-  return scored.filter(({ track }) => {
-    const primary = track.artists[0] || 'unknown';
-    counts[primary] = (counts[primary] || 0) + 1;
-    return counts[primary] <= maxPerArtist;
-  });
-}
-
-// ── Jitter: tiny random noise to break ties naturally ────────────────────────
-
-function addJitter(scored) {
-  return scored.map(s => ({
-    ...s,
-    score: s.score + (Math.random() * JITTER_RANGE * 2 - JITTER_RANGE),
-  }));
-}
-
-// ── Relaxed re-score ─────────────────────────────────────────────────────────
-
-function scoreRelaxed(track, intent) {
-  // Clone intent with broader genres (add adjacent clusters)
-  const CLUSTER_ADJACENCY = {
-    'chill':      ['indie', 'classical', 'jazz'],
-    'hip-hop':    ['rnb', 'pop', 'electronic'],
-    'indie':      ['chill', 'rock', 'pop'],
-    'pop':        ['rnb', 'indie', 'electronic'],
-    'rock':       ['indie', 'metal', 'blues'],
-    'electronic': ['chill', 'hip-hop', 'pop'],
-    'rnb':        ['pop', 'hip-hop', 'jazz'],
-    'bollywood':  ['pop', 'rnb'],
-    'kpop':       ['pop', 'rnb'],
-    'punjabi':    ['bollywood', 'hip-hop'],
-  };
-
-  const broadened = [...new Set([
-    ...(intent.targetGenres || []),
-    ...(intent.targetGenres || []).flatMap(g => CLUSTER_ADJACENCY[g] || []),
-  ])];
-
-  return scoreTrack(track, { ...intent, targetGenres: broadened });
-}
-
-// ── Main entry point ──────────────────────────────────────────────────────────
+const LANGUAGE_CLUSTER_MAP = {
+  hindi: ['bollywood'],
+  punjabi: ['punjabi'],
+  korean: ['kpop'],
+  spanish: ['latin'],
+};
 
 /**
- * @param {object[]} tracks  - NormalizedTrack[] (with moodTags populated)
- * @param {object}   intent  - { keywords, targetGenres, artist, language, label }
- * @param {object}   options - { topN, maxPerArtist }
- * @returns {{ tracks, totalConsidered, relaxed }}
+ * Detects the probable language of a track based on its genres and clusters.
  */
-function filterTracks(tracks, intent, options = {}) {
-  const topN         = options.topN         || DEFAULT_TOP_N;
-  const maxPerArtist = options.maxPerArtist || MAX_PER_ARTIST;
+function getTrackLanguage(track) {
+  const clusters = track.clusters || [];
+  const genres = (track.genres || []).map(g => g.toLowerCase());
 
-  // 1. Score all tracks
-  let scored = tracks.map(track => ({ track, ...scoreTrack(track, intent) }));
+  if (clusters.includes('bollywood') || genres.some(g => ['bollywood', 'filmi', 'hindi', 'desi'].some(s => g.includes(s)))) return 'hindi';
+  if (clusters.includes('punjabi') || genres.some(g => ['punjabi', 'bhangra'].some(s => g.includes(s)))) return 'punjabi';
+  if (clusters.includes('kpop') || genres.some(g => ['k-pop', 'korean'].some(s => g.includes(s)))) return 'korean';
+  if (clusters.includes('latin') || genres.some(g => ['latin', 'reggaeton', 'spanish'].some(s => g.includes(s)))) return 'spanish';
 
-  // 2. Apply threshold
-  let filtered = scored.filter(s => s.score >= SCORE_THRESHOLD);
-  let relaxed  = false;
+  return 'english';
+}
 
-  // 3. Fallback: relax genre clusters if too few results
-  if (filtered.length < MIN_RESULTS) {
-    console.log(`[filter] only ${filtered.length} above threshold — relaxing genre clusters`);
-    relaxed  = true;
-    filtered = tracks
-      .map(track => ({ track, ...scoreRelaxed(track, intent) }))
-      .filter(s => s.score >= SCORE_THRESHOLD * 0.6)
-      .sort((a, b) => b.score - a.score);
+/**
+ * Scores a single track against a parsed intent.
+ */
+function scoreTrack(track, intent) {
+  const { keywords = [], targetGenres = [], artist: intentArtist = null, language: intentLanguage = null } = intent;
+  
+  const weights = intentArtist 
+    ? { artist: 40, genre: 25, mood: 20, keyword: 10, popularity: 5 }
+    : { genre: 45, mood: 25, keyword: 20, popularity: 5 };
 
-    // Last resort: top N by raw score, no threshold
-    if (filtered.length < MIN_RESULTS) {
-      console.log('[filter] still too few — returning what we have, no forced fallback');
+  const matchReasons = [];
+  const components = { genre: 0, mood: 0, keyword: 0, popularity: 0, language: 0 };
+
+  // 1. Genre Score (F1-blend)
+  if (targetGenres.length > 0 && track.clusters?.length > 0) {
+    const matches = targetGenres.filter(g => track.clusters.includes(g)).length;
+    if (matches > 0) {
+      const recall = matches / targetGenres.length;
+      const precision = matches / track.clusters.length;
+      const f1 = (0.7 * recall + 0.3 * precision);
+      const bonus = recall >= 0.5 ? 0.15 : 0;
+      const rawGenre = Math.min(1, f1 + bonus);
+      components.genre = Math.round(rawGenre * 100);
+      if (rawGenre > 0.5) matchReasons.push(`genre match: ${track.clusters.join(', ')}`);
     }
   }
 
-  // 4. Sort descending
-  filtered.sort((a, b) => b.score - a.score);
+  // 2. Mood Score (Last.fm tag overlap)
+  if (keywords.length > 0 && track.moodTags?.length > 0) {
+    const trackTags = track.moodTags.map(t => t.toLowerCase());
+    const matches = keywords.filter(kw => trackTags.some(tag => tag.includes(kw) || kw.includes(tag))).length;
+    if (matches >= 1) {
+      const rawMood = Math.min(1, matches / Math.ceil(keywords.length * 0.3));
+      components.mood = Math.round(rawMood * 100);
+      matchReasons.push(`mood vibes: ${keywords.filter(kw => trackTags.some(tag => tag.includes(kw))).slice(0, 2).join(', ')}`);
+    }
+  }
 
-  // 5. Jitter + re-sort for natural variety
-  filtered = addJitter(filtered);
-  filtered.sort((a, b) => b.score - a.score);
+  // 3. Keyword Score (Track + Artist names)
+  if (keywords.length > 0) {
+    const searchText = `${track.nameLower} ${track.artistsLower.join(' ')}`;
+    const matches = keywords.filter(kw => searchText.includes(kw)).length;
+    const minRequired = keywords.length > 5 ? 2 : 1;
+    if (matches >= minRequired) {
+      const rawKeyword = Math.min(1, matches / Math.ceil(keywords.length * 0.5));
+      components.keyword = Math.round(rawKeyword * 100);
+      matchReasons.push('keyword hit');
+    }
+  }
 
-  // 6. Diversity cap
-  filtered = applyDiversityFilter(filtered, maxPerArtist);
+  // 4. Popularity Score
+  const rawPop = Math.sqrt((track.popularity || 0) / 100);
+  components.popularity = Math.round(rawPop * 100);
 
-  // 7. Take top N
+  // 5. Artist Match (Special Weight)
+  let artistScore = 0;
+  if (intentArtist) {
+    const ia = intentArtist.toLowerCase();
+    if (track.artistsLower.some(a => a.includes(ia) || ia.includes(a))) {
+      artistScore = 100;
+      matchReasons.push(`artist: ${intentArtist}`);
+    }
+  }
+
+  // 6. Language Adjustment
+  let langAdj = 0;
+  if (intentLanguage) {
+    const trackLang = getTrackLanguage(track);
+    if (trackLang === intentLanguage) {
+      langAdj = 20;
+      matchReasons.push(`language: ${intentLanguage}`);
+    } else {
+      langAdj = -20;
+    }
+  }
+  components.language = langAdj;
+
+  // Calculate final absolute score
+  let finalScore = 0;
+  if (intentArtist) {
+    finalScore = (artistScore/100 * weights.artist) +
+                 (components.genre/100 * weights.genre) +
+                 (components.mood/100 * weights.mood) +
+                 (components.keyword/100 * weights.keyword) +
+                 (components.popularity/100 * weights.popularity);
+  } else {
+    finalScore = (components.genre/100 * weights.genre) +
+                 (components.mood/100 * weights.mood) +
+                 (components.keyword/100 * weights.keyword) +
+                 (components.popularity/100 * weights.popularity);
+  }
+
+  finalScore += langAdj;
+  
   return {
-    tracks:          filtered.slice(0, topN),
-    totalConsidered: tracks.length,
-    relaxed,
+    score: Math.max(0, Math.min(100, finalScore)),
+    components,
+    matchReasons: matchReasons.length > 0 ? matchReasons : ['popularity']
+  };
+}
+
+/**
+ * Main filtering logic.
+ */
+function filterTracks(tracks, intent, options = {}) {
+  const { topN = 45, maxPerArtist = 5 } = options;
+  
+  let totalConsidered = tracks.length;
+  let relaxed = false;
+
+  // 1. Initial Scoring
+  let scored = tracks.map(t => ({
+    track: t,
+    ...scoreTrack(t, intent)
+  }));
+
+  // 2. Threshold Check
+  let filtered = scored.filter(s => s.score >= SCORE_THRESHOLD);
+
+  // 3. Fallback: Relaxation
+  if (filtered.length < 8) {
+    relaxed = true;
+    const broadenedGenres = [...new Set([
+      ...(intent.targetGenres || []),
+      ...(intent.targetGenres || []).flatMap(g => CLUSTER_ADJACENCY[g] || [])
+    ])];
+    
+    const relaxedIntent = { ...intent, targetGenres: broadenedGenres };
+    const relaxedThreshold = SCORE_THRESHOLD * 0.6;
+    
+    filtered = tracks.map(t => ({
+      track: t,
+      ...scoreTrack(t, relaxedIntent)
+    })).filter(s => s.score >= relaxedThreshold);
+
+    if (filtered.length < 8) {
+      // Last resort: return top-N by raw score
+      filtered = tracks.map(t => ({
+        track: t,
+        ...scoreTrack(t, intent)
+      })).sort((a, b) => b.score - a.score);
+    }
+  }
+
+  // 4. Apply Jitter
+  filtered = filtered.map(s => ({
+    ...s,
+    score: s.score + (Math.random() * JITTER_RANGE * 2 - JITTER_RANGE)
+  }));
+
+  // 5. Sort by score
+  filtered.sort((a, b) => b.score - a.score);
+
+  // 6. Diversity Cap (maxPerArtist)
+  const artistCounts = {};
+  const diverse = [];
+  for (const s of filtered) {
+    const primaryArtist = s.track.artists[0] || 'unknown';
+    artistCounts[primaryArtist] = (artistCounts[primaryArtist] || 0) + 1;
+    if (artistCounts[primaryArtist] <= maxPerArtist) {
+      diverse.push(s);
+    }
+  }
+
+  return {
+    tracks: diverse.slice(0, topN),
+    totalConsidered,
+    relaxed
   };
 }
 
